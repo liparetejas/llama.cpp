@@ -35,6 +35,8 @@ struct fattn_mma_config {
         return fattn_mma_config{(nthreads_), (occupancy_), (nbatch_fa_), (nbatch_K2_), (nbatch_V2_), (nbatch_combine_), (nstages_target_), (Q_in_reg_)};           \
     }                                                                                                                                                              \
 
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols);
+
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2, 128,  32,  32,  32, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 2, true);
@@ -122,6 +124,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128, 128, 1, false);
 
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+}
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_turing(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
@@ -268,7 +271,7 @@ static constexpr __device__ int get_cols_per_thread() {
 #endif // defined(AMD_WMMA_AVAILABLE)
 }
 
-static __host__ int get_cols_per_warp(const int cc) {
+static __host__ __device__ int get_cols_per_warp(const int cc) {
     if (turing_mma_available(cc) || amd_wmma_available(cc)) {
         return 16;
     } else {
@@ -1718,7 +1721,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     }
 #endif
 
-    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+//    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+    const int cols_per_warp = ncols < get_cols_per_warp(cc) ? ncols : get_cols_per_warp(cc);
     const int nwarps        = nthreads / WARP_SIZE;
 
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
