@@ -396,7 +396,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     if constexpr (use_cp_async) {
         static_assert(nbatch_fa <= 8*WARP_SIZE && nbatch_fa % 8 == 0, "bad nbatch_fa");
         static_assert(!oob_check, "OOB check incompatible with cp_async");
-        constexpr int preload = nbatch_fa >= 32 ? nbatch_fa * sizeof(half) : 64;
+        constexpr int preload_raw = nbatch_fa >= 32 ? nbatch_fa * (int)sizeof(half) : 64;
+        constexpr int preload = preload_raw <= 256 ? preload_raw : 256;
         constexpr int cols_per_warp = 8*WARP_SIZE/nbatch_fa;
         constexpr int stride_j = nwarps * cols_per_warp;
 
