@@ -105,11 +105,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(112, 112, 64, 128, 2, 128,  56,  56,  56, 2, true);
 
     // D=128
-    // Increased nbatch_fa to 128 (was 128 for ncols=8, but 64 for others in Ampere)
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8, 128, 2, 128,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 128, 2, 128,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 128, 2, 128,  64,  64,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 128, 2, 128,  64,  64,  64, 2, true);
+    // Aggressive Hopper tuning: nthreads=256 (8 warps), occupancy=1 (full SM), nbatch_fa=256 (max tile).
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128,  8, 256, 1, 256,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 16, 256, 1, 256,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 32, 256, 1, 256,  64,  64,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 64, 256, 1, 128,  64,  64,  64, 2, true);
 
     // D=256
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
