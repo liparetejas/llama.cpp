@@ -9,6 +9,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-turbo-quant.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -903,6 +904,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 0,
         .type_size                = 0,
         .is_quantized             = false,
+    },
+    [GGML_TYPE_TQ_MSE] = {
+        .type_name                = "tq_mse",
+        .blck_size                = 1,    // variable; handled per-row (head_dim)
+        .type_size                = 20,   // representative: 4 (norm) + 16 (2-bit, d=64)
+        .is_quantized             = true,
+        .to_float                 = NULL, // filled in Phase 3
+        .from_float_ref           = NULL, // filled in Phase 2
+    },
+    [GGML_TYPE_TQ_PROD] = {
+        .type_name                = "tq_prod",
+        .blck_size                = 1,    // variable; handled per-row (head_dim)
+        .type_size                = 28,   // representative: 4+4 (norm+gamma) + 8+8 (d=64 bits)
+        .is_quantized             = true,
+        .to_float                 = NULL, // filled in Phase 5
+        .from_float_ref           = NULL, // filled in Phase 4
     },
 };
 
