@@ -43,3 +43,15 @@ extern "C"
 #endif
 void ggml_cuda_tq_mse_quantize(
     const float * x, void * y, int dim, int n_rows, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Dequantise n_rows rows of TQ_MSE data to F32.
+// x         : device pointer to n_rows * tq_mse_block_size(dim) bytes
+// y         : device pointer to output n_rows * dim floats
+// dim       : head dimension; must be 64, 128, or 256
+// ---------------------------------------------------------------------------
+#ifdef __cplusplus
+extern "C"
+#endif
+void ggml_cuda_tq_mse_dequantize(
+    const void * x, float * y, int dim, int n_rows, cudaStream_t stream);

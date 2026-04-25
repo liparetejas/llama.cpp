@@ -173,6 +173,83 @@ __global__ void tq_mse_quantize_kernel(
 // Host launcher (C ABI)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TQ_MSE dequantization kernel
+// One CUDA block per row; blockDim.x = dim (64 / 128 / 256).
+// Shared memory layout:
+//   smem[0..dim-1] : y_tilde (dequantized centroid values)
+//   smem[dim]      : stored norm (written by thread 0)
+// ---------------------------------------------------------------------------
+
+__global__ void tq_mse_dequantize_kernel(
+    const uint8_t * __restrict__ x,
+    float         * __restrict__ y,
+    int   dim,
+    int   dim_idx,
+    int   row_stride_bytes,
+    const float * __restrict__ d_pi)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    extern __shared__ float smem[];
+
+    const uint8_t *in_row = x + (int64_t)row * row_stride_bytes;
+
+    // Thread 0 reads stored norm into smem[dim]
+    if (tid == 0)
+        smem[dim] = *((const float *)in_row);
+
+    // Unpack 2-bit index and load centroid for this coordinate
+    uint8_t byte = in_row[4 + tid / 4];
+    int idx = (byte >> ((tid & 3) * 2)) & 3;
+    smem[tid] = tq_d_cb_2bit[dim_idx][idx];
+    __syncthreads();
+
+    float norm_val = smem[dim];
+
+    // Inverse rotation: x_hat[tid] = sum_k( Pi[k, tid] * y_tilde[k] )
+    //                              = sum_k( d_pi[k*dim + tid] * smem[k] )
+    // Access pattern: at iteration k all threads read d_pi[k*dim .. k*dim+dim-1]
+    // This is fully coalesced across threads.
+    float x_hat = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_hat += d_pi[k * dim + tid] * smem[k];
+
+    y[(int64_t)row * dim + tid] = x_hat * norm_val;
+}
+
+// ---------------------------------------------------------------------------
+// Host dequantize launcher (C ABI)
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_cuda_tq_mse_dequantize(
+    const void * x, float * y, int dim, int n_rows, cudaStream_t stream)
+{
+    tq_cuda_init();
+
+    int dim_idx;
+    switch (dim) {
+        case  64: dim_idx = 0; break;
+        case 128: dim_idx = 1; break;
+        case 256: dim_idx = 2; break;
+        default:
+            fprintf(stderr, "ggml_cuda_tq_mse_dequantize: unsupported dim %d\n", dim);
+            return;
+    }
+
+    int row_stride = (int)tq_mse_block_size(dim);
+    size_t shmem   = (size_t)(dim + 2) * sizeof(float);
+
+    tq_mse_dequantize_kernel<<<n_rows, dim, shmem, stream>>>(
+        (const uint8_t *)x, y, dim, dim_idx, row_stride, tq_d_Pi[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
+// Host quantize launcher (C ABI)
+// ---------------------------------------------------------------------------
+
 extern "C" void ggml_cuda_tq_mse_quantize(
     const float * x, void * y, int dim, int n_rows, cudaStream_t stream)
 {

@@ -251,3 +251,42 @@ void quantize_row_tq_mse_ref(const float * x, void * y, int64_t k) {
         idx_buf[j / 4] |= (uint8_t)(best << ((j % 4) * 2));
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  CPU reference dequantization for TQ_MSE                           */
+/* ------------------------------------------------------------------ */
+
+void dequantize_row_tq_mse(const void * x, float * y, int64_t k) {
+    int dim = (int)k;
+    int di = _tq_dim_index(dim);
+    if (di < 0) return;
+
+    tq_init_rotations();
+
+    const uint8_t *in = (const uint8_t *)x;
+
+    /* Read stored norm */
+    float norm;
+    memcpy(&norm, in, sizeof(float));
+    const uint8_t *idx_buf = in + 4;
+
+    /* Unpack 2-bit indices and look up centroids */
+    float y_tilde[256];
+    const float *cb = tq_codebook_2bit[di];
+    for (int j = 0; j < dim; j++) {
+        int idx = (idx_buf[j / 4] >> ((j % 4) * 2)) & 3;
+        y_tilde[j] = cb[idx];
+    }
+
+    /* Inverse rotation: x_hat = Pi^T @ y_tilde
+     * Pi is row-major d×d orthonormal matrix.
+     * x_hat[j] = sum_k Pi[k][j] * y_tilde[k]
+     *           = sum_k tq_get_Pi_row(dim, k)[j] * y_tilde[k]      */
+    for (int j = 0; j < dim; j++) {
+        float val = 0.0f;
+        for (int kk = 0; kk < dim; kk++) {
+            val += tq_get_Pi_row(dim, kk)[j] * y_tilde[kk];
+        }
+        y[j] = val * norm;
+    }
+}

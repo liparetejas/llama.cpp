@@ -77,6 +77,10 @@ size_t tq_prod_block_size(int dim);
 /* tq_init_rotations() must have been called first.                   */
 void quantize_row_tq_mse_ref(const float * x, void * y, int64_t k);
 
+/* Dequantise one TQ_MSE row from x back into k floats at y.          */
+/* k must match the dim used during quantisation (64, 128, or 256).   */
+void dequantize_row_tq_mse(const void * x, float * y, int64_t k);
+
 #ifdef __cplusplus
 }
 #endif

@@ -813,6 +813,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TQ_MSE:
+            // TQ_MSE dequant requires dim context; use ggml_cuda_tq_mse_dequantize
+            // directly (dim from tensor ne[0]) instead of this generic path.
+            return nullptr;
         default:
             return nullptr;
     }
