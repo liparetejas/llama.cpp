@@ -200,3 +200,54 @@ const float * tq_get_S_row(int dim, int row) {
     if (di < 0 || !tq_S[di]) { return NULL; }
     return tq_S[di] + (size_t)row * dim;
 }
+
+/* ------------------------------------------------------------------ */
+/*  CPU reference quantization for TQ_MSE                             */
+/* ------------------------------------------------------------------ */
+
+void quantize_row_tq_mse_ref(const float * x, void * y, int64_t k) {
+    int dim = (int)k;
+    int di = _tq_dim_index(dim);
+    if (di < 0) return;
+
+    tq_init_rotations();
+
+    /* Compute L2 norm */
+    float sq_sum = 0.0f;
+    for (int i = 0; i < dim; i++) sq_sum += x[i] * x[i];
+    float norm = sqrtf(sq_sum);
+    float inv_norm = (norm > 1e-20f) ? 1.0f / norm : 0.0f;
+
+    /* Normalise */
+    float xn[256];
+    for (int i = 0; i < dim; i++) xn[i] = x[i] * inv_norm;
+
+    /* Write output header: 4-byte norm */
+    uint8_t *out = (uint8_t *)y;
+    memcpy(out, &norm, sizeof(float));
+
+    /* Zero-initialise the packed-index bytes */
+    size_t n_idx_bytes = (size_t)((2 * dim + 7) / 8);
+    uint8_t *idx_buf = out + 4;
+    memset(idx_buf, 0, n_idx_bytes);
+
+    const float *cb = tq_codebook_2bit[di];
+
+    /* For each rotated coordinate: rotate, find nearest centroid, pack */
+    for (int j = 0; j < dim; j++) {
+        const float *pi_row = tq_get_Pi_row(dim, j);
+
+        float y_rot = 0.0f;
+        for (int kk = 0; kk < dim; kk++) y_rot += pi_row[kk] * xn[kk];
+
+        int best = 0;
+        float best_dist = fabsf(y_rot - cb[0]);
+        for (int c = 1; c < 4; c++) {
+            float d = fabsf(y_rot - cb[c]);
+            if (d < best_dist) { best_dist = d; best = c; }
+        }
+
+        /* 2-bit packed, LSB-first: 4 indices per byte */
+        idx_buf[j / 4] |= (uint8_t)(best << ((j % 4) * 2));
+    }
+}

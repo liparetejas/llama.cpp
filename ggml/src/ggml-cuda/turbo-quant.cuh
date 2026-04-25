@@ -29,3 +29,17 @@ extern float * tq_d_S [TURBO_QUANT_NUM_DIMS];
 // init path).
 // ---------------------------------------------------------------------------
 void tq_cuda_init(void);
+
+// ---------------------------------------------------------------------------
+// Quantise n_rows rows of dim F32 values to TQ_MSE format.
+// x         : device pointer to n_rows * dim floats (row-major, contiguous)
+// y         : device pointer to output buffer (n_rows * tq_mse_block_size(dim) bytes)
+// dim       : head dimension; must be 64, 128, or 256
+// n_rows    : number of vectors to quantise
+// stream    : CUDA stream
+// ---------------------------------------------------------------------------
+#ifdef __cplusplus
+extern "C"
+#endif
+void ggml_cuda_tq_mse_quantize(
+    const float * x, void * y, int dim, int n_rows, cudaStream_t stream);

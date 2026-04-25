@@ -67,6 +67,16 @@ const float * tq_get_S_row(int dim, int row);
 size_t tq_mse_block_size(int dim);
 size_t tq_prod_block_size(int dim);
 
+/* ------------------------------------------------------------------ */
+/*  CPU reference quantization (used by type_traits.from_float_ref    */
+/*  and by tests; not performance-critical)                            */
+/* ------------------------------------------------------------------ */
+
+/* Quantise k floats from x into one TQ_MSE row at y.                 */
+/* k must be 64, 128, or 256 (the head dimension).                    */
+/* tq_init_rotations() must have been called first.                   */
+void quantize_row_tq_mse_ref(const float * x, void * y, int64_t k);
+
 #ifdef __cplusplus
 }
 #endif

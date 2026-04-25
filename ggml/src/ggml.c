@@ -911,7 +911,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 20,   // representative: 4 (norm) + 16 (2-bit, d=64)
         .is_quantized             = true,
         .to_float                 = NULL, // filled in Phase 3
-        .from_float_ref           = NULL, // filled in Phase 2
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq_mse_ref,
     },
     [GGML_TYPE_TQ_PROD] = {
         .type_name                = "tq_prod",

@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "turbo-quant.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -546,6 +547,13 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             ggml_cpy_scalar_cuda<int32_t, float>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TQ_MSE) {
+        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+        const int dim    = (int)src0->ne[0];
+        const int n_rows = (int)(ne / dim);
+        ggml_cuda_tq_mse_quantize(
+            (const float *)src0_ddc, (void *)src1_ddc,
+            dim, n_rows, main_stream);
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));

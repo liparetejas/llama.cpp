@@ -82,3 +82,116 @@ static void _tq_cuda_do_init() {
 void tq_cuda_init(void) {
     std::call_once(tq_cuda_init_flag, _tq_cuda_do_init);
 }
+
+// ---------------------------------------------------------------------------
+// TQ_MSE quantization kernel
+// One CUDA block per row; blockDim.x = dim (64 / 128 / 256).
+// Shared memory layout:
+//   smem[0..dim-1]   : input vector, normalized in-place
+//   smem[dim..dim+7] : per-warp partial sums for the block reduce
+// ---------------------------------------------------------------------------
+
+__global__ void tq_mse_quantize_kernel(
+    const float * __restrict__ x,
+    uint8_t      * __restrict__ y,
+    int   dim,
+    int   dim_idx,
+    int   row_stride_bytes,
+    const float * __restrict__ d_pi)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    extern __shared__ float smem[];
+
+    // Load input row
+    float xi = x[(int64_t)row * dim + tid];
+    smem[tid] = xi;
+    __syncthreads();
+
+    // Block reduce: sum of squares
+    float sq = xi * xi;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sq += __shfl_xor_sync(0xffffffffu, sq, mask);
+    if ((tid & 31) == 0)
+        smem[dim + (tid >> 5)] = sq;
+    __syncthreads();
+
+    float norm_val, inv_norm;
+    if (tid == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; w++) total += smem[dim + w];
+        norm_val = sqrtf(total);
+        smem[dim]     = norm_val;
+        smem[dim + 1] = (norm_val > 1e-20f) ? 1.0f / norm_val : 0.0f;
+    }
+    __syncthreads();
+
+    norm_val = smem[dim];
+    inv_norm = smem[dim + 1];
+
+    // Normalize in-place
+    smem[tid] *= inv_norm;
+    __syncthreads();
+
+    // Rotate and quantize: each thread computes one output coordinate
+    float y_rot = 0.0f;
+    for (int k = 0; k < dim; k++)
+        y_rot += d_pi[tid * dim + k] * smem[k];
+
+    // Nearest-centroid lookup
+    float best_dist = fabsf(y_rot - tq_d_cb_2bit[dim_idx][0]);
+    int best = 0;
+    for (int c = 1; c < 4; c++) {
+        float d = fabsf(y_rot - tq_d_cb_2bit[dim_idx][c]);
+        if (d < best_dist) { best_dist = d; best = c; }
+    }
+
+    // Store index into shared (overwrite; x_norm no longer needed)
+    smem[tid] = (float)best;
+    __syncthreads();
+
+    // Write output
+    uint8_t * out_row = y + (int64_t)row * row_stride_bytes;
+
+    if (tid == 0)
+        *((float *)out_row) = norm_val;
+
+    // Pack 4 x 2-bit indices per output byte, LSB-first
+    if ((tid & 3) == 0) {
+        uint8_t packed = (uint8_t)(
+            ((int)smem[tid    ]      ) |
+            ((int)smem[tid + 1] << 2) |
+            ((int)smem[tid + 2] << 4) |
+            ((int)smem[tid + 3] << 6));
+        out_row[4 + (tid >> 2)] = packed;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher (C ABI)
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_cuda_tq_mse_quantize(
+    const float * x, void * y, int dim, int n_rows, cudaStream_t stream)
+{
+    tq_cuda_init();
+
+    int dim_idx;
+    switch (dim) {
+        case  64: dim_idx = 0; break;
+        case 128: dim_idx = 1; break;
+        case 256: dim_idx = 2; break;
+        default:
+            fprintf(stderr, "ggml_cuda_tq_mse_quantize: unsupported dim %d\n", dim);
+            return;
+    }
+
+    int row_stride = (int)tq_mse_block_size(dim);
+    size_t shmem   = (size_t)(dim + 8) * sizeof(float);
+
+    tq_mse_quantize_kernel<<<n_rows, dim, shmem, stream>>>(
+        x, (uint8_t *)y, dim, dim_idx, row_stride, tq_d_Pi[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
