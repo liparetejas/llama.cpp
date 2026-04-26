@@ -85,6 +85,9 @@ void dequantize_row_tq_mse(const void * x, float * y, int64_t k);
 /* 2-bit MSE stage + 1-bit QJL residual stage (b=3 total bits).       */
 void quantize_row_tq_prod_ref(const float * x, void * y, int64_t k);
 
+/* Dequantise one TQ_PROD row from x back into k floats at y.         */
+void dequantize_row_tq_prod(const void * x, float * y, int64_t k);
+
 #ifdef __cplusplus
 }
 #endif

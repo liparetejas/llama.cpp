@@ -817,6 +817,9 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             // TQ_MSE dequant requires dim context; use ggml_cuda_tq_mse_dequantize
             // directly (dim from tensor ne[0]) instead of this generic path.
             return nullptr;
+        case GGML_TYPE_TQ_PROD:
+            // TQ_PROD dequant requires dim context; use ggml_cuda_tq_prod_dequantize directly.
+            return nullptr;
         default:
             return nullptr;
     }

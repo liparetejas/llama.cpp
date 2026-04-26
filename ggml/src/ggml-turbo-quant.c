@@ -379,3 +379,64 @@ void quantize_row_tq_prod_ref(const float * x, void * y, int64_t k) {
         qjl_buf[j / 8] |= (uint8_t)(bit << (j % 8));
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  CPU reference dequantization for TQ_PROD                          */
+/* ------------------------------------------------------------------ */
+
+void dequantize_row_tq_prod(const void * x, float * y, int64_t k) {
+    int dim = (int)k;
+    int di = _tq_dim_index(dim);
+    if (di < 0) return;
+
+    tq_init_rotations();
+
+    const uint8_t *in = (const uint8_t *)x;
+
+    float norm, gamma;
+    memcpy(&norm,  in,     sizeof(float));
+    memcpy(&gamma, in + 4, sizeof(float));
+
+    size_t n_mse_bytes = (size_t)((2 * dim + 7) / 8);
+    const uint8_t *mse_buf = in + 8;
+    const uint8_t *qjl_buf = in + 8 + n_mse_bytes;
+
+    /* Unpack MSE indices, reconstruct y_tilde */
+    const float *cb = tq_codebook_2bit[di];
+    float y_tilde[256];
+    for (int j = 0; j < dim; j++) {
+        int idx = (mse_buf[j / 4] >> ((j % 4) * 2)) & 3;
+        y_tilde[j] = cb[idx];
+    }
+
+    /* x_mse = Pi^T @ y_tilde */
+    float x_mse[256];
+    for (int j = 0; j < dim; j++) {
+        float val = 0.0f;
+        for (int kk = 0; kk < dim; kk++)
+            val += tq_get_Pi_row(dim, kk)[j] * y_tilde[kk];
+        x_mse[j] = val;
+    }
+
+    /* Unpack QJL signs: bit=1 -> +1.0, bit=0 -> -1.0 */
+    float qjl_signs[256];
+    for (int j = 0; j < dim; j++) {
+        int bit = (qjl_buf[j / 8] >> (j % 8)) & 1;
+        qjl_signs[j] = (bit == 1) ? 1.0f : -1.0f;
+    }
+
+    /* x_qjl = sqrt(pi/2)/dim * gamma * S^T @ qjl_signs
+     * S^T row j = column j of S = tq_get_S_row(dim, k)[j] for k=0..dim-1 */
+    float coeff = sqrtf(3.14159265358979f / 2.0f) / (float)dim;
+    float x_qjl[256];
+    for (int j = 0; j < dim; j++) {
+        float val = 0.0f;
+        for (int kk = 0; kk < dim; kk++)
+            val += tq_get_S_row(dim, kk)[j] * qjl_signs[kk];
+        x_qjl[j] = coeff * gamma * val;
+    }
+
+    /* x_hat = (x_mse + x_qjl) * norm */
+    for (int j = 0; j < dim; j++)
+        y[j] = (x_mse[j] + x_qjl[j]) * norm;
+}

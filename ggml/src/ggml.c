@@ -918,7 +918,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 1,    // variable; handled per-row (head_dim)
         .type_size                = 32,   // representative: 4+4 (norm+gamma) + 16+8 (2-bit MSE d=64, 1-bit QJL d=64)
         .is_quantized             = true,
-        .to_float                 = NULL, // filled in Phase 5
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq_prod,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq_prod_ref,
     },
 };

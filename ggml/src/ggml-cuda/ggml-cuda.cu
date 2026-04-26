@@ -1401,6 +1401,9 @@ static void ggml_cuda_op_mul_mat_cublas(
             if (src0->type == GGML_TYPE_TQ_MSE) {
                 ggml_cuda_tq_mse_dequantize(src0_dd_i, src0_ddq_as_f32.get(),
                                              (int)ne00, (int)row_diff, stream);
+            } else if (src0->type == GGML_TYPE_TQ_PROD) {
+                ggml_cuda_tq_prod_dequantize(src0_dd_i, src0_ddq_as_f32.get(),
+                                              (int)ne00, (int)row_diff, stream);
             } else {
                 const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
                 GGML_ASSERT(to_fp32_cuda != nullptr);
@@ -1412,6 +1415,9 @@ static void ggml_cuda_op_mul_mat_cublas(
             if (src1->type == GGML_TYPE_TQ_MSE) {
                 ggml_cuda_tq_mse_dequantize(src1_ddf_i, src1_ddq_as_f32.get(),
                                              (int)ne10, (int)src1_ncols, stream);
+            } else if (src1->type == GGML_TYPE_TQ_PROD) {
+                ggml_cuda_tq_prod_dequantize(src1_ddf_i, src1_ddq_as_f32.get(),
+                                              (int)ne10, (int)src1_ncols, stream);
             } else {
                 const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
                 GGML_ASSERT(to_fp32_cuda != nullptr);
@@ -4908,6 +4914,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TQ_PROD) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_TQ_PROD && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {

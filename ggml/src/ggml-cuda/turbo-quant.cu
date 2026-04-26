@@ -454,3 +454,98 @@ extern "C" void ggml_cuda_tq_prod_quantize(
         tq_d_Pi[dim_idx], tq_d_S[dim_idx]);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------
+// TQ_PROD dequantization kernel
+// One CUDA block per row; blockDim.x = dim.
+// Shared memory layout (dim + 2 floats):
+//   smem[0..dim-1] : y_tilde (centroid values), then overwritten with qjl_signs
+//   smem[dim]      : norm
+//   smem[dim+1]    : gamma
+// ---------------------------------------------------------------------------
+
+__global__ void tq_prod_dequantize_kernel(
+    const uint8_t * __restrict__ x,
+    float         * __restrict__ y,
+    int   dim,
+    int   dim_idx,
+    int   row_stride_bytes,
+    const float * __restrict__ d_pi,
+    const float * __restrict__ d_s)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    extern __shared__ float smem[];
+
+    const uint8_t *in_row = x + (int64_t)row * row_stride_bytes;
+    int n_mse_bytes = (2 * dim + 7) / 8;
+
+    if (tid == 0) {
+        smem[dim]     = *((const float *)in_row);         // norm
+        smem[dim + 1] = *((const float *)(in_row + 4));   // gamma
+    }
+
+    // Unpack 2-bit MSE index for this thread; load centroid into shared
+    uint8_t mse_byte = in_row[8 + tid / 4];
+    int mse_idx = (mse_byte >> ((tid & 3) * 2)) & 3;
+    smem[tid] = tq_d_cb_2bit[dim_idx][mse_idx];
+    __syncthreads();
+
+    float norm_val  = smem[dim];
+    float gamma_val = smem[dim + 1];
+
+    // x_mse[tid] = Pi^T row tid · y_tilde = sum_k d_pi[k*dim + tid] * smem[k]
+    // Coalesced: all threads read d_pi[k*dim .. k*dim+dim-1] together
+    float x_mse = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_mse += d_pi[k * dim + tid] * smem[k];
+
+    // Sync before overwriting smem: all threads must finish reading y_tilde
+    // before any thread overwrites its slot with the QJL sign.
+    __syncthreads();
+
+    // Overwrite shared with QJL signs for this thread
+    uint8_t qjl_byte = in_row[8 + n_mse_bytes + tid / 8];
+    int qjl_bit = (qjl_byte >> (tid & 7)) & 1;
+    smem[tid] = (qjl_bit == 1) ? 1.0f : -1.0f;
+    __syncthreads();
+
+    // x_qjl[tid] = coeff * gamma * S^T row tid · qjl_signs
+    // S^T row tid = column tid of S = d_s[k*dim + tid] (coalesced)
+    float coeff = sqrtf(3.14159265f / 2.0f) / (float)dim;
+    float x_qjl = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_qjl += d_s[k * dim + tid] * smem[k];
+    x_qjl *= coeff * gamma_val;
+
+    y[(int64_t)row * dim + tid] = (x_mse + x_qjl) * norm_val;
+}
+
+// ---------------------------------------------------------------------------
+// Host dequantize launcher (C ABI)
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_cuda_tq_prod_dequantize(
+    const void * x, float * y, int dim, int n_rows, cudaStream_t stream)
+{
+    tq_cuda_init();
+
+    int dim_idx;
+    switch (dim) {
+        case  64: dim_idx = 0; break;
+        case 128: dim_idx = 1; break;
+        case 256: dim_idx = 2; break;
+        default:
+            fprintf(stderr, "ggml_cuda_tq_prod_dequantize: unsupported dim %d\n", dim);
+            return;
+    }
+
+    int row_stride = (int)tq_prod_block_size(dim);
+    size_t shmem   = (size_t)(dim + 2) * sizeof(float);
+
+    tq_prod_dequantize_kernel<<<n_rows, dim, shmem, stream>>>(
+        (const uint8_t *)x, y, dim, dim_idx, row_stride,
+        tq_d_Pi[dim_idx], tq_d_S[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
