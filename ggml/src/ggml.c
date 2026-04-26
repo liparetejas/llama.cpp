@@ -916,10 +916,10 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_TQ_PROD] = {
         .type_name                = "tq_prod",
         .blck_size                = 1,    // variable; handled per-row (head_dim)
-        .type_size                = 28,   // representative: 4+4 (norm+gamma) + 8+8 (d=64 bits)
+        .type_size                = 32,   // representative: 4+4 (norm+gamma) + 16+8 (2-bit MSE d=64, 1-bit QJL d=64)
         .is_quantized             = true,
         .to_float                 = NULL, // filled in Phase 5
-        .from_float_ref           = NULL, // filled in Phase 4
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq_prod_ref,
     },
 };
 

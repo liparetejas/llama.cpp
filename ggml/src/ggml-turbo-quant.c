@@ -46,9 +46,9 @@ size_t tq_mse_block_size(int dim) {
 }
 
 size_t tq_prod_block_size(int dim) {
-    /* 4 (norm) + 4 (gamma) + ceil(1*dim/8) (MSE indices at 1 bit)
-     * + ceil(1*dim/8) (QJL sign bits)                              */
-    return 4 + 4 + (size_t)((dim + 7) / 8) + (size_t)((dim + 7) / 8);
+    /* 4 (norm) + 4 (gamma) + ceil(2*dim/8) (2-bit MSE indices)
+     * + ceil(dim/8) (1-bit QJL sign bits)                         */
+    return 4 + 4 + (size_t)((2 * dim + 7) / 8) + (size_t)((dim + 7) / 8);
 }
 
 /* ------------------------------------------------------------------ */
@@ -288,5 +288,94 @@ void dequantize_row_tq_mse(const void * x, float * y, int64_t k) {
             val += tq_get_Pi_row(dim, kk)[j] * y_tilde[kk];
         }
         y[j] = val * norm;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  CPU reference quantization for TQ_PROD                            */
+/*  Block layout: 4B norm | 4B gamma | ceil(2*dim/8)B MSE | ceil(dim/8)B QJL */
+/* ------------------------------------------------------------------ */
+
+void quantize_row_tq_prod_ref(const float * x, void * y, int64_t k) {
+    int dim = (int)k;
+    int di = _tq_dim_index(dim);
+    if (di < 0) return;
+
+    tq_init_rotations();
+
+    /* Compute L2 norm */
+    float sq_sum = 0.0f;
+    for (int i = 0; i < dim; i++) sq_sum += x[i] * x[i];
+    float norm = sqrtf(sq_sum);
+    float inv_norm = (norm > 1e-20f) ? 1.0f / norm : 0.0f;
+
+    /* Normalise */
+    float xn[256];
+    for (int i = 0; i < dim; i++) xn[i] = x[i] * inv_norm;
+
+    /* Stage 1: MSE quantization in rotated domain */
+    const float *cb = tq_codebook_2bit[di];
+    int mse_idx[256];
+    float x_mse[256];  /* reconstructed MSE approximation in original domain */
+
+    /* Compute MSE indices (same as TQ_MSE quant) */
+    for (int j = 0; j < dim; j++) {
+        const float *pi_row = tq_get_Pi_row(dim, j);
+        float yr = 0.0f;
+        for (int kk = 0; kk < dim; kk++) yr += pi_row[kk] * xn[kk];
+
+        int best = 0;
+        float best_dist = fabsf(yr - cb[0]);
+        for (int c = 1; c < 4; c++) {
+            float d = fabsf(yr - cb[c]);
+            if (d < best_dist) { best_dist = d; best = c; }
+        }
+        mse_idx[j] = best;
+    }
+
+    /* Reconstruct x_mse = Pi^T @ y_tilde */
+    float y_tilde[256];
+    for (int j = 0; j < dim; j++) y_tilde[j] = cb[mse_idx[j]];
+
+    for (int j = 0; j < dim; j++) {
+        float val = 0.0f;
+        for (int kk = 0; kk < dim; kk++)
+            val += tq_get_Pi_row(dim, kk)[j] * y_tilde[kk];
+        x_mse[j] = val;
+    }
+
+    /* Residual r = xn - x_mse */
+    float r[256];
+    for (int j = 0; j < dim; j++) r[j] = xn[j] - x_mse[j];
+
+    /* Gamma = ||r|| */
+    float gamma_sq = 0.0f;
+    for (int j = 0; j < dim; j++) gamma_sq += r[j] * r[j];
+    float gamma = sqrtf(gamma_sq);
+
+    /* QJL: sign(S @ r), one bit per coordinate */
+    size_t n_mse_bytes = (size_t)((2 * dim + 7) / 8);
+    size_t n_qjl_bytes = (size_t)((dim + 7) / 8);
+
+    uint8_t *out = (uint8_t *)y;
+    memcpy(out,     &norm,  sizeof(float));
+    memcpy(out + 4, &gamma, sizeof(float));
+
+    uint8_t *mse_buf = out + 8;
+    uint8_t *qjl_buf = out + 8 + n_mse_bytes;
+    memset(mse_buf, 0, n_mse_bytes);
+    memset(qjl_buf, 0, n_qjl_bytes);
+
+    /* Pack 2-bit MSE indices (same packing as TQ_MSE) */
+    for (int j = 0; j < dim; j++)
+        mse_buf[j / 4] |= (uint8_t)(mse_idx[j] << ((j % 4) * 2));
+
+    /* Compute QJL bits and pack 1 bit per coordinate */
+    for (int j = 0; j < dim; j++) {
+        const float *s_row = tq_get_S_row(dim, j);
+        float dot = 0.0f;
+        for (int kk = 0; kk < dim; kk++) dot += s_row[kk] * r[kk];
+        int bit = (dot >= 0.0f) ? 1 : 0;
+        qjl_buf[j / 8] |= (uint8_t)(bit << (j % 8));
     }
 }

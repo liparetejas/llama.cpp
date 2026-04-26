@@ -63,7 +63,7 @@ const float * tq_get_S_row(int dim, int row);
 
 /* Number of bytes to store one quantised head vector of length dim    */
 /*  TQ_MSE:  4 (norm) + ceil(2*dim/8)                                 */
-/*  TQ_PROD: 4 (norm) + 4 (gamma) + ceil(1*dim/8) + ceil(1*dim/8)    */
+/*  TQ_PROD: 4 (norm) + 4 (gamma) + ceil(2*dim/8) + ceil(dim/8)      */
 size_t tq_mse_block_size(int dim);
 size_t tq_prod_block_size(int dim);
 
@@ -80,6 +80,10 @@ void quantize_row_tq_mse_ref(const float * x, void * y, int64_t k);
 /* Dequantise one TQ_MSE row from x back into k floats at y.          */
 /* k must match the dim used during quantisation (64, 128, or 256).   */
 void dequantize_row_tq_mse(const void * x, float * y, int64_t k);
+
+/* Quantise k floats from x into one TQ_PROD row at y.                */
+/* 2-bit MSE stage + 1-bit QJL residual stage (b=3 total bits).       */
+void quantize_row_tq_prod_ref(const float * x, void * y, int64_t k);
 
 #ifdef __cplusplus
 }

@@ -55,3 +55,14 @@ extern "C"
 #endif
 void ggml_cuda_tq_mse_dequantize(
     const void * x, float * y, int dim, int n_rows, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Quantise n_rows rows to TQ_PROD format (2-bit MSE + 1-bit QJL, b=3).
+// x         : device pointer to n_rows * dim floats
+// y         : device pointer to output buffer (n_rows * tq_prod_block_size(dim) bytes)
+// ---------------------------------------------------------------------------
+#ifdef __cplusplus
+extern "C"
+#endif
+void ggml_cuda_tq_prod_quantize(
+    const float * x, void * y, int dim, int n_rows, cudaStream_t stream);

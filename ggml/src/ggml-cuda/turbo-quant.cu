@@ -272,3 +272,185 @@ extern "C" void ggml_cuda_tq_mse_quantize(
         x, (uint8_t *)y, dim, dim_idx, row_stride, tq_d_Pi[dim_idx]);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------
+// TQ_PROD quantization kernel
+// One CUDA block per row; blockDim.x = dim.
+// Shared memory layout (2*dim + 19 floats):
+//   smem[0..dim-1]           : x_norm, then overwritten with residual r
+//   smem[dim..dim+7]         : warp partial sums for norm
+//   smem[dim+8]              : norm_val
+//   smem[dim+9]              : inv_norm
+//   smem[dim+10..2*dim+9]    : y_tilde (centroid values in rotated domain, then Pi^T@y_tilde)
+//   smem[2*dim+10..2*dim+17] : warp partial sums for gamma
+//   smem[2*dim+18]           : gamma_val
+// ---------------------------------------------------------------------------
+
+__global__ void tq_prod_quantize_kernel(
+    const float * __restrict__ x,
+    uint8_t      * __restrict__ y,
+    int   dim,
+    int   dim_idx,
+    int   row_stride_bytes,
+    const float * __restrict__ d_pi,
+    const float * __restrict__ d_s)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    extern __shared__ float smem[];
+
+    float * x_norm   = smem;               // [0..dim-1]
+    float * warp_buf = smem + dim;          // [dim..dim+7]
+    float * y_tilde  = smem + dim + 10;    // [dim+10..2*dim+9]
+    float * gamma_buf = smem + 2*dim + 10; // [2*dim+10..2*dim+17]
+
+    // Load and square for norm
+    float xi = x[(int64_t)row * dim + tid];
+    x_norm[tid] = xi;
+    __syncthreads();
+
+    // Block reduce: sum of squares
+    float sq = xi * xi;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sq += __shfl_xor_sync(0xffffffffu, sq, mask);
+    if ((tid & 31) == 0)
+        warp_buf[tid >> 5] = sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; w++) total += warp_buf[w];
+        float nv = sqrtf(total);
+        smem[dim + 8] = nv;
+        smem[dim + 9] = (nv > 1e-20f) ? 1.0f / nv : 0.0f;
+    }
+    __syncthreads();
+
+    float norm_val = smem[dim + 8];
+    float inv_norm = smem[dim + 9];
+
+    // Normalize in-place
+    x_norm[tid] *= inv_norm;
+    __syncthreads();
+
+    // Stage 1: MSE quantization
+    // Each thread computes one rotated coordinate, finds nearest centroid
+    float y_rot = 0.0f;
+    for (int k = 0; k < dim; k++)
+        y_rot += d_pi[tid * dim + k] * x_norm[k];
+
+    float best_dist = fabsf(y_rot - tq_d_cb_2bit[dim_idx][0]);
+    int best = 0;
+    for (int c = 1; c < 4; c++) {
+        float d = fabsf(y_rot - tq_d_cb_2bit[dim_idx][c]);
+        if (d < best_dist) { best_dist = d; best = c; }
+    }
+
+    // Store centroid value for inverse rotation
+    y_tilde[tid] = tq_d_cb_2bit[dim_idx][best];
+    __syncthreads();
+
+    // Inverse rotation: x_mse[tid] = sum_k( Pi[k, tid] * y_tilde[k] )
+    // Access d_pi[k*dim + tid] — coalesced across threads
+    float x_mse = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_mse += d_pi[k * dim + tid] * y_tilde[k];
+
+    // Residual r = x_norm - x_mse; overwrite x_norm slot
+    float r_val = x_norm[tid] - x_mse;
+    x_norm[tid] = r_val;
+    __syncthreads();
+
+    // Gamma = ||r||: block reduce
+    float rsq = r_val * r_val;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        rsq += __shfl_xor_sync(0xffffffffu, rsq, mask);
+    if ((tid & 31) == 0)
+        gamma_buf[tid >> 5] = rsq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; w++) total += gamma_buf[w];
+        smem[2*dim + 18] = sqrtf(total);
+    }
+    __syncthreads();
+
+    float gamma_val = smem[2*dim + 18];
+
+    // QJL: each thread computes Sr_j = dot(S[j], r) and extracts sign bit
+    float sr = 0.0f;
+    for (int k = 0; k < dim; k++)
+        sr += d_s[tid * dim + k] * x_norm[k];   // x_norm now holds r
+
+    int qjl_bit = (sr >= 0.0f) ? 1 : 0;
+
+    // Pack QJL bits using __ballot_sync (warp mask, 32 bits per warp)
+    uint32_t ballot = __ballot_sync(0xffffffffu, qjl_bit);
+
+    // Write output
+    uint8_t * out_row = y + (int64_t)row * row_stride_bytes;
+    int n_mse_bytes = (2 * dim + 7) / 8;
+
+    if (tid == 0) {
+        *((float *)out_row)       = norm_val;
+        *((float *)(out_row + 4)) = gamma_val;
+    }
+
+    // Pack 2-bit MSE indices (same as TQ_MSE: 4 indices per byte)
+    // Reuse y_tilde to store int indices temporarily
+    // best is a register value; pack directly
+    // Store best index into y_tilde (now free after inverse rotation)
+    y_tilde[tid] = (float)best;
+    __syncthreads();
+
+    if ((tid & 3) == 0) {
+        uint8_t packed = (uint8_t)(
+            ((int)y_tilde[tid    ]      ) |
+            ((int)y_tilde[tid + 1] << 2) |
+            ((int)y_tilde[tid + 2] << 4) |
+            ((int)y_tilde[tid + 3] << 6));
+        out_row[8 + (tid >> 2)] = packed;
+    }
+
+    // Write QJL bits: one uint32 per warp (lane 0 of each warp writes)
+    if ((tid & 31) == 0) {
+        int warp_id = tid >> 5;
+        uint8_t * qjl_buf = out_row + 8 + n_mse_bytes;
+        // Copy 4 bytes of ballot to qjl_buf at warp_id * 4
+        uint32_t * dst = (uint32_t *)(qjl_buf + warp_id * 4);
+        *dst = ballot;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host launcher (C ABI)
+// ---------------------------------------------------------------------------
+
+extern "C" void ggml_cuda_tq_prod_quantize(
+    const float * x, void * y, int dim, int n_rows, cudaStream_t stream)
+{
+    tq_cuda_init();
+
+    int dim_idx;
+    switch (dim) {
+        case  64: dim_idx = 0; break;
+        case 128: dim_idx = 1; break;
+        case 256: dim_idx = 2; break;
+        default:
+            fprintf(stderr, "ggml_cuda_tq_prod_quantize: unsupported dim %d\n", dim);
+            return;
+    }
+
+    int row_stride = (int)tq_prod_block_size(dim);
+    // smem: (2*dim + 19) floats
+    size_t shmem = (size_t)(2 * dim + 19) * sizeof(float);
+
+    tq_prod_quantize_kernel<<<n_rows, dim, shmem, stream>>>(
+        x, (uint8_t *)y, dim, dim_idx, row_stride,
+        tq_d_Pi[dim_idx], tq_d_S[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
