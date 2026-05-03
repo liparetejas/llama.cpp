@@ -31,13 +31,16 @@ __global__ void tq_mse_rotate_q_kernel(
     smem[tid] = Q_row[tid];
     __syncthreads();
 
-    float qr = 0.0f;
-    for (int j = 0; j < D; j++) {
-        qr = fmaf(d_Pi_T[j * D + tid], smem[j], qr);
+    float qr0=0,qr1=0,qr2=0,qr3=0;
+    for (int j = 0; j < D; j += 4) {
+        qr0 = fmaf(d_Pi_T[(j+0)*D+tid], smem[j+0], qr0);
+        qr1 = fmaf(d_Pi_T[(j+1)*D+tid], smem[j+1], qr1);
+        qr2 = fmaf(d_Pi_T[(j+2)*D+tid], smem[j+2], qr2);
+        qr3 = fmaf(d_Pi_T[(j+3)*D+tid], smem[j+3], qr3);
     }
 
     const int64_t out_idx = ((int64_t)(sequence * ne01 + ic0) * ne02 + head) * D;
-    q_pi_out[out_idx + tid] = qr * scale;
+    q_pi_out[out_idx + tid] = (qr0 + qr1 + qr2 + qr3) * scale;
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +295,16 @@ __global__ void flash_attn_tq_mse_combine(
     __syncthreads();
     const float inv_denom = 1.0f / acc_smem[D];
 
-    float out = 0.0f;
-    for (int j = 0; j < D; j++) out = fmaf(d_Pi[j * D + tid], acc_smem[j], out);
+    // 4-way unrolled Pi^T matvec: 4 independent FMA chains for ILP=4
+    float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+    for (int j = 0; j < D; j += 4) {
+        out0 = fmaf(d_Pi[(j+0) * D + tid], acc_smem[j+0], out0);
+        out1 = fmaf(d_Pi[(j+1) * D + tid], acc_smem[j+1], out1);
+        out2 = fmaf(d_Pi[(j+2) * D + tid], acc_smem[j+2], out2);
+        out3 = fmaf(d_Pi[(j+3) * D + tid], acc_smem[j+3], out3);
+    }
 
-    dst[tid] = out * inv_denom;
+    dst[tid] = (out0 + out1 + out2 + out3) * inv_denom;
 }
 
 void ggml_cuda_flash_attn_ext_tq_mse(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

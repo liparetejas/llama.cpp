@@ -44,16 +44,22 @@ __global__ void tq_prod_rotate_q_kernel(
     smem[tid] = Q_row[tid];
     __syncthreads();
 
-    float qr = 0.0f, qs = 0.0f;
-    for (int j = 0; j < D; j++) {
-        const float qj = smem[j];
-        qr = fmaf(d_Pi_T[j * D + tid], qj, qr);
-        qs = fmaf(d_S_T [j * D + tid], qj, qs);
+    float qr0=0,qr1=0,qr2=0,qr3=0;
+    float qs0=0,qs1=0,qs2=0,qs3=0;
+    for (int j = 0; j < D; j += 4) {
+        qr0 = fmaf(d_Pi_T[(j+0)*D+tid], smem[j+0], qr0);
+        qr1 = fmaf(d_Pi_T[(j+1)*D+tid], smem[j+1], qr1);
+        qr2 = fmaf(d_Pi_T[(j+2)*D+tid], smem[j+2], qr2);
+        qr3 = fmaf(d_Pi_T[(j+3)*D+tid], smem[j+3], qr3);
+        qs0 = fmaf(d_S_T [(j+0)*D+tid], smem[j+0], qs0);
+        qs1 = fmaf(d_S_T [(j+1)*D+tid], smem[j+1], qs1);
+        qs2 = fmaf(d_S_T [(j+2)*D+tid], smem[j+2], qs2);
+        qs3 = fmaf(d_S_T [(j+3)*D+tid], smem[j+3], qs3);
     }
 
     const int64_t out_idx = ((int64_t)(sequence * ne01 + ic0) * ne02 + head) * D;
-    q_pi_out[out_idx + tid] = qr * scale;
-    q_s_out [out_idx + tid] = qs * scale;
+    q_pi_out[out_idx + tid] = (qr0+qr1+qr2+qr3) * scale;
+    q_s_out [out_idx + tid] = (qs0+qs1+qs2+qs3) * scale;
 }
 
 // ---------------------------------------------------------------------------
@@ -374,14 +380,21 @@ __global__ void flash_attn_tq_prod_combine(
 
     const float qjl_coeff = sqrtf(3.14159265f / 2.0f) / (float)D;
 
-    // Phase 3: out = Pi^T @ rot_smem  +  coeff * S^T @ sqjl_smem
-    float out_mse = 0.0f, out_qjl = 0.0f;
-    for (int j = 0; j < D; j++) {
-        out_mse = fmaf(d_Pi[j * D + tid], rot_smem[j],  out_mse);
-        out_qjl = fmaf(d_S [j * D + tid], sqjl_smem[j], out_qjl);
+    // Pi^T and S^T matvecs: 4-way unrolled for ILP=4 on both chains
+    float mse0=0,mse1=0,mse2=0,mse3=0;
+    float qjl0=0,qjl1=0,qjl2=0,qjl3=0;
+    for (int j = 0; j < D; j += 4) {
+        mse0 = fmaf(d_Pi[(j+0)*D+tid], rot_smem [j+0], mse0);
+        mse1 = fmaf(d_Pi[(j+1)*D+tid], rot_smem [j+1], mse1);
+        mse2 = fmaf(d_Pi[(j+2)*D+tid], rot_smem [j+2], mse2);
+        mse3 = fmaf(d_Pi[(j+3)*D+tid], rot_smem [j+3], mse3);
+        qjl0 = fmaf(d_S [(j+0)*D+tid], sqjl_smem[j+0], qjl0);
+        qjl1 = fmaf(d_S [(j+1)*D+tid], sqjl_smem[j+1], qjl1);
+        qjl2 = fmaf(d_S [(j+2)*D+tid], sqjl_smem[j+2], qjl2);
+        qjl3 = fmaf(d_S [(j+3)*D+tid], sqjl_smem[j+3], qjl3);
     }
 
-    dst[tid] = (out_mse + qjl_coeff * out_qjl) * inv_denom;
+    dst[tid] = ((mse0+mse1+mse2+mse3) + qjl_coeff*(qjl0+qjl1+qjl2+qjl3)) * inv_denom;
 }
 
 void ggml_cuda_flash_attn_ext_tq_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
