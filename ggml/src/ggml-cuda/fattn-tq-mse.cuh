@@ -280,10 +280,25 @@ __global__ void flash_attn_tq_mse_combine(
     float kqmax = meta[0].x;
     for (int l = 1; l < parallel_blocks; l++) kqmax = fmaxf(kqmax, meta[l].x);
 
+    // 4-way unrolled accumulation (requires parallel_blocks % 4 == 0)
     float acc_t = 0.0f;
-    for (int l = 0; l < parallel_blocks; l++) {
-        const float sc = expf(meta[l].x - kqmax);
-        acc_t = fmaf(sc, VKQ_parts[(int64_t)l * D + tid], acc_t);
+    if (parallel_blocks % 4 == 0) {
+        float a0=0,a1=0,a2=0,a3=0;
+        for (int l = 0; l < parallel_blocks; l += 4) {
+            const float sc0 = expf(meta[l+0].x - kqmax);
+            const float sc1 = expf(meta[l+1].x - kqmax);
+            const float sc2 = expf(meta[l+2].x - kqmax);
+            const float sc3 = expf(meta[l+3].x - kqmax);
+            a0 = fmaf(sc0, VKQ_parts[(int64_t)(l+0)*D+tid], a0);
+            a1 = fmaf(sc1, VKQ_parts[(int64_t)(l+1)*D+tid], a1);
+            a2 = fmaf(sc2, VKQ_parts[(int64_t)(l+2)*D+tid], a2);
+            a3 = fmaf(sc3, VKQ_parts[(int64_t)(l+3)*D+tid], a3);
+        }
+        acc_t = a0+a1+a2+a3;
+    } else {
+        for (int l = 0; l < parallel_blocks; l++) {
+            acc_t = fmaf(expf(meta[l].x - kqmax), VKQ_parts[(int64_t)l*D+tid], acc_t);
+        }
     }
     acc_smem[tid] = acc_t;
 

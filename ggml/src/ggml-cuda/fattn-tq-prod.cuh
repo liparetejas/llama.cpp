@@ -356,13 +356,35 @@ __global__ void flash_attn_tq_prod_combine(
         kqmax = fmaxf(kqmax, meta[l].x);
     }
 
-    // Combine acc_rot and acc_sqjl across splits
+    // Combine acc_rot and acc_sqjl across splits (4-way ILP when divisible)
     float rot_t = 0.0f, sqjl_t = 0.0f;
-    for (int l = 0; l < parallel_blocks; l++) {
-        const float sc = expf(meta[l].x - kqmax);
-        const int64_t base = (int64_t)l * 2 * D;
-        rot_t  = fmaf(sc, VKQ_parts[base + tid],     rot_t);
-        sqjl_t = fmaf(sc, VKQ_parts[base + D + tid], sqjl_t);
+    if (parallel_blocks % 4 == 0) {
+        float r0=0,r1=0,r2=0,r3=0, q0=0,q1=0,q2=0,q3=0;
+        for (int l = 0; l < parallel_blocks; l += 4) {
+            const float sc0 = expf(meta[l+0].x - kqmax);
+            const float sc1 = expf(meta[l+1].x - kqmax);
+            const float sc2 = expf(meta[l+2].x - kqmax);
+            const float sc3 = expf(meta[l+3].x - kqmax);
+            const int64_t b0 = (int64_t)(l+0)*2*D, b1=(int64_t)(l+1)*2*D;
+            const int64_t b2 = (int64_t)(l+2)*2*D, b3=(int64_t)(l+3)*2*D;
+            r0 = fmaf(sc0, VKQ_parts[b0+tid],   r0);
+            r1 = fmaf(sc1, VKQ_parts[b1+tid],   r1);
+            r2 = fmaf(sc2, VKQ_parts[b2+tid],   r2);
+            r3 = fmaf(sc3, VKQ_parts[b3+tid],   r3);
+            q0 = fmaf(sc0, VKQ_parts[b0+D+tid], q0);
+            q1 = fmaf(sc1, VKQ_parts[b1+D+tid], q1);
+            q2 = fmaf(sc2, VKQ_parts[b2+D+tid], q2);
+            q3 = fmaf(sc3, VKQ_parts[b3+D+tid], q3);
+        }
+        rot_t  = r0+r1+r2+r3;
+        sqjl_t = q0+q1+q2+q3;
+    } else {
+        for (int l = 0; l < parallel_blocks; l++) {
+            const float sc      = expf(meta[l].x - kqmax);
+            const int64_t base  = (int64_t)l * 2 * D;
+            rot_t  = fmaf(sc, VKQ_parts[base+tid],   rot_t);
+            sqjl_t = fmaf(sc, VKQ_parts[base+D+tid], sqjl_t);
+        }
     }
     rot_smem [tid] = rot_t;
     sqjl_smem[tid] = sqjl_t;
