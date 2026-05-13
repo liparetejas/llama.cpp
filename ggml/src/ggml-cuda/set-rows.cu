@@ -1,5 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turbo-quant.cuh"
+#include <type_traits>
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -309,6 +311,31 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_TQ_MSE || dst->type == GGML_TYPE_TQ_PROD) {
+        const int64_t s01 = nb01/sizeof(float);
+        const int64_t s02 = nb02/sizeof(float);
+        const int64_t s03 = nb03/sizeof(float);
+        const int64_t s10 = nb10/sizeof(idx_t);
+        const int64_t s11 = nb11/sizeof(idx_t);
+        const int64_t s12 = nb12/sizeof(idx_t);
+        const int head_dim = (int)ggml_blck_size(dst->type);
+        if (dst->type == GGML_TYPE_TQ_MSE) {
+            if constexpr (std::is_same_v<idx_t, int32_t>) {
+                ggml_cuda_tq_mse_set_rows_i32(src0_d, (const int32_t*)src1_d, dst->data,
+                    ne00, ne01, ne02, ne03, s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+            } else {
+                ggml_cuda_tq_mse_set_rows_i64(src0_d, (const int64_t*)src1_d, dst->data,
+                    ne00, ne01, ne02, ne03, s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+            }
+        } else {
+            if constexpr (std::is_same_v<idx_t, int32_t>) {
+                ggml_cuda_tq_prod_set_rows_i32(src0_d, (const int32_t*)src1_d, dst->data,
+                    ne00, ne01, ne02, ne03, s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+            } else {
+                ggml_cuda_tq_prod_set_rows_i64(src0_d, (const int64_t*)src1_d, dst->data,
+                    ne00, ne01, ne02, ne03, s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+            }
+        }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }

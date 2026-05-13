@@ -1399,11 +1399,13 @@ static void ggml_cuda_op_mul_mat_cublas(
         if (src0->type != GGML_TYPE_F32) {
             src0_ddq_as_f32.alloc(row_diff*ne00);
             if (src0->type == GGML_TYPE_TQ_MSE) {
+                const int hd0 = (int)ggml_blck_size(src0->type);
                 ggml_cuda_tq_mse_dequantize(src0_dd_i, src0_ddq_as_f32.get(),
-                                             (int)ne00, (int)row_diff, stream);
+                                             hd0, (int)(row_diff * (ne00 / hd0)), stream);
             } else if (src0->type == GGML_TYPE_TQ_PROD) {
+                const int hd0 = (int)ggml_blck_size(src0->type);
                 ggml_cuda_tq_prod_dequantize(src0_dd_i, src0_ddq_as_f32.get(),
-                                              (int)ne00, (int)row_diff, stream);
+                                              hd0, (int)(row_diff * (ne00 / hd0)), stream);
             } else {
                 const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
                 GGML_ASSERT(to_fp32_cuda != nullptr);
@@ -1413,11 +1415,13 @@ static void ggml_cuda_op_mul_mat_cublas(
         if (src1->type != GGML_TYPE_F32) {
             src1_ddq_as_f32.alloc(src1_ncols*ne10);
             if (src1->type == GGML_TYPE_TQ_MSE) {
+                const int hd1 = (int)ggml_blck_size(src1->type);
                 ggml_cuda_tq_mse_dequantize(src1_ddf_i, src1_ddq_as_f32.get(),
-                                             (int)ne10, (int)src1_ncols, stream);
+                                             hd1, (int)(src1_ncols * (ne10 / hd1)), stream);
             } else if (src1->type == GGML_TYPE_TQ_PROD) {
+                const int hd1 = (int)ggml_blck_size(src1->type);
                 ggml_cuda_tq_prod_dequantize(src1_ddf_i, src1_ddq_as_f32.get(),
-                                              (int)ne10, (int)src1_ncols, stream);
+                                              hd1, (int)(src1_ncols * (ne10 / hd1)), stream);
             } else {
                 const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
                 GGML_ASSERT(to_fp32_cuda != nullptr);
@@ -4854,7 +4858,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
-                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
+                       op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
+                       op->type == GGML_TYPE_TQ_MSE || op->type == GGML_TYPE_TQ_PROD) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;

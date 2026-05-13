@@ -484,6 +484,440 @@ __global__ void flash_attn_tq_mse_batch_partial_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Kernel 2c: All-thread softmax — eliminates smem Phase B entirely.
+//
+// Key insight: after the 5-step shfl_xor warp-reduce, ALL 32 threads hold the
+// same full dot product `partial`. Since norm_k/maskh are broadcast loads (same
+// address for all threads), every thread can independently compute kq, s_old,
+// a_w, and update w_kq_max/w_kq_sum with zero inter-thread communication.
+//
+// Eliminates vs BATCH kernel:
+//   - sold_smem writes/reads  (NWARPS floats per outer iter)
+//   - aw_smem writes/reads    (NWARPS*BATCH floats per outer iter)
+//   - __syncwarp per outer iter
+// Cost: 2 expf per token on all 32 threads — but SFU processes all 32 threads
+// in the same wall-clock time as 1 thread (8 SFU units × 4 passes = same cycles).
+// Net: strictly fewer ops in the hot loop while expf cost is unchanged.
+//
+// #pragma unroll 4 lets the compiler overlap K loads of token k+1 with the
+// shfl chain of token k, hiding global memory latency.
+// ---------------------------------------------------------------------------
+template<int D>
+__launch_bounds__(D, 4)
+__global__ void flash_attn_tq_mse_allthread_kernel(
+        const float  * __restrict__ q_pi_buf,
+        const char   * __restrict__ K_data,
+        const char   * __restrict__ V_data,
+        const char   * __restrict__ mask,
+        float        * __restrict__ dst_parts,
+        float2       * __restrict__ dst_meta,
+        const float  max_bias,
+        const float  m0,
+        const float  m1,
+        const uint32_t n_head_log2,
+        const float  logit_softcap,
+        const int32_t ne01,
+        const int32_t ne02,
+        const int32_t ne03,
+        const int32_t ne11,
+        const int32_t ne12,
+        const int32_t nb11,
+        const int32_t nb12,
+        const int64_t nb13,
+        const int32_t nb21,
+        const int32_t nb22,
+        const int64_t nb23,
+        const int32_t ne32,
+        const int32_t nb31,
+        const int64_t nb33,
+        const int32_t n_splits
+) {
+    static_assert(D == 128, "flash_attn_tq_mse_allthread: only D=128 supported");
+    constexpr int NWARPS  = D / WARP_SIZE;  // 4
+    constexpr int dim_idx = 1;
+
+    const int tid      = threadIdx.x;
+    const int warp_id  = tid / WARP_SIZE;
+    const int lane_id  = tid % WARP_SIZE;
+    const int ic0      = blockIdx.x;
+    const int split    = blockIdx.y;
+    const int head     = blockIdx.z % ne02;
+    const int sequence = blockIdx.z / ne02;
+    const int gqa_ratio = ne02 / ne12;
+
+    const int tokens_per_split = (ne11 + n_splits - 1) / n_splits;
+    const int k_start = split * tokens_per_split;
+    const int k_end   = min(k_start + tokens_per_split, ne11);
+
+    const int64_t q_idx = ((int64_t)(sequence * ne01 + ic0) * ne02 + head) * D;
+    const float qp0 = q_pi_buf[q_idx + lane_id];
+    const float qp1 = q_pi_buf[q_idx + lane_id + 32];
+    const float qp2 = q_pi_buf[q_idx + lane_id + 64];
+    const float qp3 = q_pi_buf[q_idx + lane_id + 96];
+
+    const char * K_head = K_data + (int64_t)nb13*sequence + (int64_t)nb12*(head/gqa_ratio);
+    const char * V_head = V_data + (int64_t)nb23*sequence + (int64_t)nb22*(head/gqa_ratio);
+    const half * maskh  = mask ? (const half *)(mask + (int64_t)nb33*(sequence%ne32)
+                                                      + (int64_t)nb31*ic0) : nullptr;
+    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+
+    const int bs0 = (lane_id & 3) << 1;
+    const int bi0 = lane_id >> 2;
+    const int bi1 = bi0 + (D/4/4);
+    const int bi2 = bi0 + (2*D/4/4);
+    const int bi3 = bi0 + (3*D/4/4);
+
+    // Smem layout (same as OLD partial kernel — no aw/sold smem needed):
+    // [warp_acc_rot: NWARPS*D | kq_max_arr: NWARPS | kq_sum_arr: NWARPS |
+    //  scale_arr: NWARPS | global_slot: 1 | finsum_slot: 1]
+    extern __shared__ float smem[];
+    float * const warp_acc_smem = smem;
+    float * const kq_max_arr    = smem + NWARPS * D;
+    float * const kq_sum_arr    = kq_max_arr + NWARPS;
+    float * const scale_arr     = kq_sum_arr + NWARPS;
+    float * const global_slot   = scale_arr  + NWARPS;
+    float * const finsum_slot   = global_slot + 1;
+
+    // Load 4-entry codebook into scalar registers
+    const float cb_r0 = tq_d_cb_2bit[dim_idx][0];
+    const float cb_r1 = tq_d_cb_2bit[dim_idx][1];
+    const float cb_r2 = tq_d_cb_2bit[dim_idx][2];
+    const float cb_r3 = tq_d_cb_2bit[dim_idx][3];
+    #define CB_SEL_AT(idx) (((idx) & 2) ? (((idx) & 1) ? cb_r3 : cb_r2) : (((idx) & 1) ? cb_r1 : cb_r0))
+
+    // All threads maintain identical w_kq_max, w_kq_sum (no sync needed).
+    float w_kq_max = -FLT_MAX / 2.0f;
+    float w_kq_sum = 0.0f;
+    float w_acc0 = 0.0f, w_acc1 = 0.0f, w_acc2 = 0.0f, w_acc3 = 0.0f;
+
+    for (int k = k_start + warp_id; k < k_end; k += NWARPS) {
+        const uint8_t * K_blk = (const uint8_t *)(K_head + (int64_t)k * nb11);
+
+        // Dot product (all threads, 5-step shfl_xor reduce)
+        const float cb_k0 = CB_SEL_AT((K_blk[4 + bi0] >> bs0) & 3);
+        const float cb_k1 = CB_SEL_AT((K_blk[4 + bi1] >> bs0) & 3);
+        const float cb_k2 = CB_SEL_AT((K_blk[4 + bi2] >> bs0) & 3);
+        const float cb_k3 = CB_SEL_AT((K_blk[4 + bi3] >> bs0) & 3);
+        float partial = qp0*cb_k0 + qp1*cb_k1 + qp2*cb_k2 + qp3*cb_k3;
+        #pragma unroll
+        for (int off = 16; off >= 1; off >>= 1)
+            partial += __shfl_xor_sync(0xFFFFFFFF, partial, off);
+
+        // All threads compute kq — norm_k/maskh are broadcast loads (1 L1 txn for all 32)
+        const float norm_k = *((const float *) K_blk);
+        float kq = partial * norm_k;
+        if (logit_softcap != 0.0f) kq = logit_softcap * tanhf(kq);
+        if (maskh) kq += slope * __half2float(maskh[k]);
+
+        // All threads update running softmax state (identical across all lanes, no sync needed)
+        const float kq_max_new = fmaxf(w_kq_max, kq + FATTN_KQ_MAX_OFFSET);
+        const float s_old = expf(w_kq_max - kq_max_new);
+        const float a_w   = expf(kq        - kq_max_new);
+        w_kq_max = kq_max_new;
+        w_kq_sum = w_kq_sum * s_old + a_w;
+
+        // Scale existing accumulator and accumulate V (per-thread dims diverge here)
+        w_acc0 *= s_old;
+        w_acc1 *= s_old;
+        w_acc2 *= s_old;
+        w_acc3 *= s_old;
+
+        const uint8_t * V_blk = (const uint8_t *)(V_head + (int64_t)k * nb21);
+        const float norm_v = *((const float *) V_blk);
+        const float aw_nv  = a_w * norm_v;
+        const float cb_v0  = CB_SEL_AT((V_blk[4 + bi0] >> bs0) & 3);
+        const float cb_v1  = CB_SEL_AT((V_blk[4 + bi1] >> bs0) & 3);
+        const float cb_v2  = CB_SEL_AT((V_blk[4 + bi2] >> bs0) & 3);
+        const float cb_v3  = CB_SEL_AT((V_blk[4 + bi3] >> bs0) & 3);
+        w_acc0 = fmaf(aw_nv, cb_v0, w_acc0);
+        w_acc1 = fmaf(aw_nv, cb_v1, w_acc1);
+        w_acc2 = fmaf(aw_nv, cb_v2, w_acc2);
+        w_acc3 = fmaf(aw_nv, cb_v3, w_acc3);
+    }
+    #undef CB_SEL_AT
+
+    // -- Merge phase (same as other partial kernels) --------------------------
+    warp_acc_smem[warp_id * D + lane_id]      = w_acc0;
+    warp_acc_smem[warp_id * D + lane_id + 32] = w_acc1;
+    warp_acc_smem[warp_id * D + lane_id + 64] = w_acc2;
+    warp_acc_smem[warp_id * D + lane_id + 96] = w_acc3;
+    if (lane_id == 0) {
+        kq_max_arr[warp_id] = w_kq_max;
+        kq_sum_arr[warp_id] = w_kq_sum;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float gmax = kq_max_arr[0];
+        for (int w = 1; w < NWARPS; w++) gmax = fmaxf(gmax, kq_max_arr[w]);
+        float fsum = 0.0f;
+        for (int w = 0; w < NWARPS; w++) {
+            const float sc = expf(kq_max_arr[w] - gmax);
+            scale_arr[w] = sc;
+            fsum += sc * kq_sum_arr[w];
+        }
+        *global_slot = gmax;
+        *finsum_slot = fsum;
+    }
+    __syncthreads();
+
+    const float final_sum = *finsum_slot;
+    float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+    for (int w = 0; w < NWARPS; w++) {
+        const float sc = scale_arr[w];
+        out0 = fmaf(sc, warp_acc_smem[w * D + lane_id],      out0);
+        out1 = fmaf(sc, warp_acc_smem[w * D + lane_id + 32], out1);
+        out2 = fmaf(sc, warp_acc_smem[w * D + lane_id + 64], out2);
+        out3 = fmaf(sc, warp_acc_smem[w * D + lane_id + 96], out3);
+    }
+
+    const int j_dst = (sequence * ne01 + ic0) * ne02 + head;
+    const int64_t base = ((int64_t)j_dst * n_splits + split) * D;
+    if (warp_id == 0) {
+        dst_parts[base + lane_id]      = out0;
+        dst_parts[base + lane_id + 32] = out1;
+        dst_parts[base + lane_id + 64] = out2;
+        dst_parts[base + lane_id + 96] = out3;
+    }
+    if (tid == 0) {
+        dst_meta[(int64_t)j_dst * n_splits + split] = make_float2(*global_slot, final_sum);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 2d: Half-warp attention — 4-step warp-reduce instead of 5-step.
+//
+// Key insight: 5 shfl_xor steps (off=16,8,4,2,1) are needed to reduce 32 threads.
+// If we split the 128-thread block into 8 "half-warps" of 16 threads, each
+// handling a different K token, the reduction only needs 4 steps (off=8,4,2,1).
+// shfl_xor with off<=8 never crosses a 16-thread boundary → both half-warps
+// of a 32-thread warp stay fully isolated. off=16 is eliminated.
+//
+// Trade-off: 8 elements/thread (stride 16) instead of 4 (stride 32).
+//   +  1 fewer shfl step per token → ~12% fewer serial latency cycles
+//   +  ALL-THREAD softmax (no smem/syncwarp for aw/sold)
+//   -  8 FMA per token (vs 4) — hidden behind shfl chain latency
+//   -  8 K/V byte loads per thread (vs 4) — ~same L1 traffic total
+//   -  8 acc registers (vs 4) — higher register pressure
+//
+// Per-token: 8 FMA + 4 shfl = 64 cycle latency vs 4 FMA + 5 shfl = 80 cycles.
+// Theoretical: 20% speedup in the shfl-dominated inner loop.
+// ---------------------------------------------------------------------------
+template<int D>
+__launch_bounds__(D, 4)
+__global__ void flash_attn_tq_mse_halfwarp_kernel(
+        const float  * __restrict__ q_pi_buf,
+        const char   * __restrict__ K_data,
+        const char   * __restrict__ V_data,
+        const char   * __restrict__ mask,
+        float        * __restrict__ dst_parts,
+        float2       * __restrict__ dst_meta,
+        const float  max_bias,
+        const float  m0,
+        const float  m1,
+        const uint32_t n_head_log2,
+        const float  logit_softcap,
+        const int32_t ne01,
+        const int32_t ne02,
+        const int32_t ne03,
+        const int32_t ne11,
+        const int32_t ne12,
+        const int32_t nb11,
+        const int32_t nb12,
+        const int64_t nb13,
+        const int32_t nb21,
+        const int32_t nb22,
+        const int64_t nb23,
+        const int32_t ne32,
+        const int32_t nb31,
+        const int64_t nb33,
+        const int32_t n_splits
+) {
+    static_assert(D == 128, "flash_attn_tq_mse_halfwarp: only D=128 supported");
+    constexpr int NHALF_WARPS = D / 16;  // 8
+    constexpr int dim_idx = 1;
+
+    const int tid      = threadIdx.x;
+    const int hw_id    = tid / 16;   // 0..7 — which half-warp
+    const int hw_lane  = tid % 16;   // 0..15 — position within half-warp
+    const int warp_id  = tid / 32;   // 0..3 — for final dst_parts write
+    const int lane_id  = tid % 32;   // 0..31 — for final dst_parts write
+    const int ic0      = blockIdx.x;
+    const int split    = blockIdx.y;
+    const int head     = blockIdx.z % ne02;
+    const int sequence = blockIdx.z / ne02;
+    const int gqa_ratio = ne02 / ne12;
+
+    const int tokens_per_split = (ne11 + n_splits - 1) / n_splits;
+    const int k_start = split * tokens_per_split;
+    const int k_end   = min(k_start + tokens_per_split, ne11);
+
+    const int64_t q_idx = ((int64_t)(sequence * ne01 + ic0) * ne02 + head) * D;
+    // Each thread holds 8 Q dims at stride 16 (hw_lane, hw_lane+16, ..., hw_lane+112)
+    const float qp0 = q_pi_buf[q_idx + hw_lane];
+    const float qp1 = q_pi_buf[q_idx + hw_lane + 16];
+    const float qp2 = q_pi_buf[q_idx + hw_lane + 32];
+    const float qp3 = q_pi_buf[q_idx + hw_lane + 48];
+    const float qp4 = q_pi_buf[q_idx + hw_lane + 64];
+    const float qp5 = q_pi_buf[q_idx + hw_lane + 80];
+    const float qp6 = q_pi_buf[q_idx + hw_lane + 96];
+    const float qp7 = q_pi_buf[q_idx + hw_lane + 112];
+
+    const char * K_head = K_data + (int64_t)nb13*sequence + (int64_t)nb12*(head/gqa_ratio);
+    const char * V_head = V_data + (int64_t)nb23*sequence + (int64_t)nb22*(head/gqa_ratio);
+    const half * maskh  = mask ? (const half *)(mask + (int64_t)nb33*(sequence%ne32)
+                                                      + (int64_t)nb31*ic0) : nullptr;
+    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+
+    // K/V index extraction with stride-16 layout:
+    // thread hw_lane accesses dims hw_lane + {0,16,...,112} = byte (hw_lane+k*16)/4 + 4,
+    // bit-shift (hw_lane % 4)*2 (same for all k since hw_lane+k*16 ≡ hw_lane mod 4).
+    const int bs  = (hw_lane & 3) << 1;   // bit shift: 0,2,4,6
+    const int bb  = hw_lane >> 2;          // byte_base: 0..3
+    const int bi0 = bb;                    // byte offset for dim hw_lane
+    const int bi1 = bb + 4;               // byte offset for dim hw_lane+16
+    const int bi2 = bb + 8;
+    const int bi3 = bb + 12;
+    const int bi4 = bb + 16;
+    const int bi5 = bb + 20;
+    const int bi6 = bb + 24;
+    const int bi7 = bb + 28;
+
+    // Smem layout (NHALF_WARPS=8 groups):
+    // [hw_acc_rot: NHALF_WARPS*D | kq_max_arr: NHALF_WARPS | kq_sum_arr: NHALF_WARPS |
+    //  scale_arr: NHALF_WARPS | global_slot: 1 | finsum_slot: 1]
+    extern __shared__ float smem[];
+    float * const hw_acc_smem = smem;
+    float * const kq_max_arr  = smem + NHALF_WARPS * D;
+    float * const kq_sum_arr  = kq_max_arr + NHALF_WARPS;
+    float * const scale_arr   = kq_sum_arr + NHALF_WARPS;
+    float * const global_slot = scale_arr  + NHALF_WARPS;
+    float * const finsum_slot = global_slot + 1;
+
+    const float cb_r0 = tq_d_cb_2bit[dim_idx][0];
+    const float cb_r1 = tq_d_cb_2bit[dim_idx][1];
+    const float cb_r2 = tq_d_cb_2bit[dim_idx][2];
+    const float cb_r3 = tq_d_cb_2bit[dim_idx][3];
+    #define CB_SEL_HW(idx) (((idx) & 2) ? (((idx) & 1) ? cb_r3 : cb_r2) : (((idx) & 1) ? cb_r1 : cb_r0))
+
+    // All half-warp threads independently maintain the running softmax state.
+    // Since partial is identical across all 16 hw_lane threads after the 4-step reduce,
+    // and norm_k/maskh are broadcast loads, kq is identical → no sync needed.
+    float w_kq_max = -FLT_MAX / 2.0f;
+    float w_kq_sum = 0.0f;
+    float w_acc0 = 0.0f, w_acc1 = 0.0f, w_acc2 = 0.0f, w_acc3 = 0.0f;
+    float w_acc4 = 0.0f, w_acc5 = 0.0f, w_acc6 = 0.0f, w_acc7 = 0.0f;
+
+    for (int k = k_start + hw_id; k < k_end; k += NHALF_WARPS) {
+        const uint8_t * K_blk = (const uint8_t *)(K_head + (int64_t)k * nb11);
+
+        // 8-term dot product + 4-step shfl_xor (off=8,4,2,1 stays within 16-thread half-warp)
+        const float cb_k0 = CB_SEL_HW((K_blk[4 + bi0] >> bs) & 3);
+        const float cb_k1 = CB_SEL_HW((K_blk[4 + bi1] >> bs) & 3);
+        const float cb_k2 = CB_SEL_HW((K_blk[4 + bi2] >> bs) & 3);
+        const float cb_k3 = CB_SEL_HW((K_blk[4 + bi3] >> bs) & 3);
+        const float cb_k4 = CB_SEL_HW((K_blk[4 + bi4] >> bs) & 3);
+        const float cb_k5 = CB_SEL_HW((K_blk[4 + bi5] >> bs) & 3);
+        const float cb_k6 = CB_SEL_HW((K_blk[4 + bi6] >> bs) & 3);
+        const float cb_k7 = CB_SEL_HW((K_blk[4 + bi7] >> bs) & 3);
+        float partial = qp0*cb_k0 + qp1*cb_k1 + qp2*cb_k2 + qp3*cb_k3 +
+                        qp4*cb_k4 + qp5*cb_k5 + qp6*cb_k6 + qp7*cb_k7;
+        #pragma unroll
+        for (int off = 8; off >= 1; off >>= 1)
+            partial += __shfl_xor_sync(0xFFFFFFFF, partial, off);
+
+        // Broadcast loads — all 16 threads load the same address, 1 L1 transaction each
+        const float norm_k = *((const float *) K_blk);
+        float kq = partial * norm_k;
+        if (logit_softcap != 0.0f) kq = logit_softcap * tanhf(kq);
+        if (maskh) kq += slope * __half2float(maskh[k]);
+
+        const float kq_max_new = fmaxf(w_kq_max, kq + FATTN_KQ_MAX_OFFSET);
+        const float s_old = expf(w_kq_max - kq_max_new);
+        const float a_w   = expf(kq        - kq_max_new);
+        w_kq_max = kq_max_new;
+        w_kq_sum = w_kq_sum * s_old + a_w;
+
+        w_acc0 *= s_old; w_acc1 *= s_old; w_acc2 *= s_old; w_acc3 *= s_old;
+        w_acc4 *= s_old; w_acc5 *= s_old; w_acc6 *= s_old; w_acc7 *= s_old;
+
+        const uint8_t * V_blk = (const uint8_t *)(V_head + (int64_t)k * nb21);
+        const float norm_v = *((const float *) V_blk);
+        const float aw_nv  = a_w * norm_v;
+        const float cb_v0  = CB_SEL_HW((V_blk[4 + bi0] >> bs) & 3);
+        const float cb_v1  = CB_SEL_HW((V_blk[4 + bi1] >> bs) & 3);
+        const float cb_v2  = CB_SEL_HW((V_blk[4 + bi2] >> bs) & 3);
+        const float cb_v3  = CB_SEL_HW((V_blk[4 + bi3] >> bs) & 3);
+        const float cb_v4  = CB_SEL_HW((V_blk[4 + bi4] >> bs) & 3);
+        const float cb_v5  = CB_SEL_HW((V_blk[4 + bi5] >> bs) & 3);
+        const float cb_v6  = CB_SEL_HW((V_blk[4 + bi6] >> bs) & 3);
+        const float cb_v7  = CB_SEL_HW((V_blk[4 + bi7] >> bs) & 3);
+        w_acc0 = fmaf(aw_nv, cb_v0, w_acc0);
+        w_acc1 = fmaf(aw_nv, cb_v1, w_acc1);
+        w_acc2 = fmaf(aw_nv, cb_v2, w_acc2);
+        w_acc3 = fmaf(aw_nv, cb_v3, w_acc3);
+        w_acc4 = fmaf(aw_nv, cb_v4, w_acc4);
+        w_acc5 = fmaf(aw_nv, cb_v5, w_acc5);
+        w_acc6 = fmaf(aw_nv, cb_v6, w_acc6);
+        w_acc7 = fmaf(aw_nv, cb_v7, w_acc7);
+    }
+    #undef CB_SEL_HW
+
+    // -- Merge: write half-warp acc to smem, combine across 8 groups --------------
+    // Thread hw_lane of hw_id writes dims hw_lane+{0,16,...,112}.
+    hw_acc_smem[hw_id * D + hw_lane]       = w_acc0;
+    hw_acc_smem[hw_id * D + hw_lane + 16]  = w_acc1;
+    hw_acc_smem[hw_id * D + hw_lane + 32]  = w_acc2;
+    hw_acc_smem[hw_id * D + hw_lane + 48]  = w_acc3;
+    hw_acc_smem[hw_id * D + hw_lane + 64]  = w_acc4;
+    hw_acc_smem[hw_id * D + hw_lane + 80]  = w_acc5;
+    hw_acc_smem[hw_id * D + hw_lane + 96]  = w_acc6;
+    hw_acc_smem[hw_id * D + hw_lane + 112] = w_acc7;
+    if (hw_lane == 0) {
+        kq_max_arr[hw_id] = w_kq_max;
+        kq_sum_arr[hw_id] = w_kq_sum;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float gmax = kq_max_arr[0];
+        for (int hw = 1; hw < NHALF_WARPS; hw++) gmax = fmaxf(gmax, kq_max_arr[hw]);
+        float fsum = 0.0f;
+        for (int hw = 0; hw < NHALF_WARPS; hw++) {
+            const float sc = expf(kq_max_arr[hw] - gmax);
+            scale_arr[hw] = sc;
+            fsum += sc * kq_sum_arr[hw];
+        }
+        *global_slot = gmax;
+        *finsum_slot = fsum;
+    }
+    __syncthreads();
+
+    // Combine: thread lane_id accumulates all 8 half-warps for its 4 output dims
+    const float final_sum = *finsum_slot;
+    float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+    for (int hw = 0; hw < NHALF_WARPS; hw++) {
+        const float sc = scale_arr[hw];
+        out0 = fmaf(sc, hw_acc_smem[hw * D + lane_id],      out0);
+        out1 = fmaf(sc, hw_acc_smem[hw * D + lane_id + 32], out1);
+        out2 = fmaf(sc, hw_acc_smem[hw * D + lane_id + 64], out2);
+        out3 = fmaf(sc, hw_acc_smem[hw * D + lane_id + 96], out3);
+    }
+
+    const int j_dst = (sequence * ne01 + ic0) * ne02 + head;
+    const int64_t base = ((int64_t)j_dst * n_splits + split) * D;
+    if (warp_id == 0) {
+        dst_parts[base + lane_id]      = out0;
+        dst_parts[base + lane_id + 32] = out1;
+        dst_parts[base + lane_id + 64] = out2;
+        dst_parts[base + lane_id + 96] = out3;
+    }
+    if (tid == 0) {
+        dst_meta[(int64_t)j_dst * n_splits + split] = make_float2(*global_slot, final_sum);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Kernel 3: combine splits + single Pi^T unrotation.
 // Grid: (ne01, ne02, ne03), Block: (D).
 // Smem: [meta: 2*parallel_blocks floats | acc_combined: D floats | denom: 1 float]

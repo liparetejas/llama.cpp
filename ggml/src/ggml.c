@@ -907,16 +907,16 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_TQ_MSE] = {
         .type_name                = "tq_mse",
-        .blck_size                = 1,    // variable; handled per-row (head_dim)
-        .type_size                = 20,   // representative: 4 (norm) + 16 (2-bit, d=64)
+        .blck_size                = 128,  // head_dim; each block encodes one 128-d head vector
+        .type_size                = 36,   // tq_mse_block_size(128) = 4 (norm) + 32 (2-bit packed)
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_tq_mse,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq_mse_ref,
     },
     [GGML_TYPE_TQ_PROD] = {
         .type_name                = "tq_prod",
-        .blck_size                = 1,    // variable; handled per-row (head_dim)
-        .type_size                = 32,   // representative: 4+4 (norm+gamma) + 16+8 (2-bit MSE d=64, 1-bit QJL d=64)
+        .blck_size                = 128,  // head_dim; each block encodes one 128-d head vector
+        .type_size                = 56,   // tq_prod_block_size(128) = 4+4 (norm+gamma) + 32+16 (2-bit MSE + 1-bit QJL)
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_tq_prod,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq_prod_ref,

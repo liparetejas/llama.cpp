@@ -2,6 +2,8 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
+#include "fattn-tq-mse.cuh"
+#include "fattn-tq-prod.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
@@ -290,6 +292,8 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_TQ_MSE   = 500,  // fused on-the-fly TQ_MSE dequant
+    BEST_FATTN_KERNEL_TQ_PROD  = 600,  // fused on-the-fly TQ_PROD dequant (MSE + QJL)
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -327,6 +331,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
+    // Fused TQ_MSE kernel: both K and V are TQ_MSE, D=128, any sm_75+
+    if (K->type == GGML_TYPE_TQ_MSE && V->type == GGML_TYPE_TQ_MSE && K->ne[0] == 128) {
+        return BEST_FATTN_KERNEL_TQ_MSE;
+    }
+
+    // Fused TQ_PROD kernel: both K and V are TQ_PROD, D=128, any sm_75+
+    if (K->type == GGML_TYPE_TQ_PROD && V->type == GGML_TYPE_TQ_PROD && K->ne[0] == 128) {
+        return BEST_FATTN_KERNEL_TQ_PROD;
+    }
+
     switch (K->ne[0]) {
         case  40:
         case  64:
@@ -354,7 +368,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        // TQ types are converted to F16 by launch_fattn unconditionally, so
+        // mixed K/V combinations involving TQ are safe with the MMA_F16 kernel.
+        const bool k_is_tq = K->type == GGML_TYPE_TQ_MSE || K->type == GGML_TYPE_TQ_PROD;
+        const bool v_is_tq = V->type == GGML_TYPE_TQ_MSE || V->type == GGML_TYPE_TQ_PROD;
+        if (!k_is_tq && !v_is_tq) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -371,6 +391,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TQ_MSE:
+        case GGML_TYPE_TQ_PROD:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -383,25 +405,38 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // TQ types are converted to F16 by launch_fattn; treat them as non-quantized for kernel selection.
+    auto is_eff_quantized = [](ggml_type t) {
+        return ggml_is_quantized(t) && t != GGML_TYPE_TQ_MSE && t != GGML_TYPE_TQ_PROD;
+    };
+    const bool K_is_eff_quant = is_eff_quantized(K->type);
+    const bool V_is_eff_quant = is_eff_quantized(V->type);
+    // TQ types are always converted to F16 by launch_fattn; the VEC kernel has no TQ
+    // dispatch, so never route TQ-involved combinations there.
+    const bool has_tq_type = K->type == GGML_TYPE_TQ_MSE || K->type == GGML_TYPE_TQ_PROD ||
+                              V->type == GGML_TYPE_TQ_MSE || V->type == GGML_TYPE_TQ_PROD;
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
-            if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+            if (!K_is_eff_quant && !V_is_eff_quant) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                } else {
-                    if (Q->ne[1] == 1) {
-                        return BEST_FATTN_KERNEL_VEC;
+                if (!has_tq_type) {
+                    if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                        if (Q->ne[1] <= 2) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
+                    } else {
+                        if (Q->ne[1] == 1) {
+                            return BEST_FATTN_KERNEL_VEC;
+                        }
                     }
                 }
             }
-            if (!gqa_opt_applies && Q->ne[1] == 1) {
+            if (!gqa_opt_applies && Q->ne[1] == 1 && !has_tq_type) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -498,6 +533,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_WMMA_F16:
             ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_TQ_MSE:
+            ggml_cuda_flash_attn_ext_tq_mse(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_TQ_PROD:
+            ggml_cuda_flash_attn_ext_tq_prod(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

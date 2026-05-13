@@ -1,6 +1,7 @@
 #pragma once
 #include "../ggml-turbo-quant.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 // ---------------------------------------------------------------------------
 // Constant memory: Lloyd-Max codebooks (small, read-only, all threads share)
@@ -17,10 +18,16 @@ extern __constant__ float tq_d_cb_1bit[TURBO_QUANT_NUM_DIMS][2];
 // ---------------------------------------------------------------------------
 // Device pointers: Pi and S matrices (one per supported dim 64/128/256)
 // Set at init; read-only during inference.
+// tq_d_Pi[di]   : Pi  stored row-major Pi[i*D+j]      → Pi[i][j]
+// tq_d_Pi_T[di] : Pi^T stored row-major Pi_T[j*D+i]   → used for COALESCED Phase-1 Q rotation
+// tq_d_S[di]    : S   stored row-major S[i*D+j]
+// tq_d_S_T[di]  : S^T stored row-major S_T[j*D+i]     → used for COALESCED Phase-1 Q→S rotation
 // ---------------------------------------------------------------------------
 
-extern float * tq_d_Pi[TURBO_QUANT_NUM_DIMS];
-extern float * tq_d_S [TURBO_QUANT_NUM_DIMS];
+extern float * tq_d_Pi  [TURBO_QUANT_NUM_DIMS];
+extern float * tq_d_S   [TURBO_QUANT_NUM_DIMS];
+extern float * tq_d_Pi_T[TURBO_QUANT_NUM_DIMS];
+extern float * tq_d_S_T [TURBO_QUANT_NUM_DIMS];
 
 // ---------------------------------------------------------------------------
 // Initialise device-side TurboQuant data.
@@ -77,3 +84,54 @@ extern "C"
 #endif
 void ggml_cuda_tq_prod_dequantize(
     const void * x, float * y, int dim, int n_rows, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Convert TQ_MSE / TQ_PROD → F16 for flash-attention (used by ggml_get_to_fp16_cuda).
+// k = total element count (nelements of the tensor = n_rows * 128).
+// ---------------------------------------------------------------------------
+void ggml_cuda_tq_mse_to_f16(const void * x, half * y, int64_t k, cudaStream_t stream);
+void ggml_cuda_tq_prod_to_f16(const void * x, half * y, int64_t k, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// SET_ROWS: write indexed rows from F32 src into TQ_MSE/TQ_PROD dst.
+// src0_d : float input  [ne01 x ne00], strides s01/s02/s03 in floats
+// src1_d : row indices  [ne01 x ne02 x ne03], strides s10/s11/s12 in idx_t
+// dst_d  : TQ output, byte strides nb1/nb2/nb3
+// ---------------------------------------------------------------------------
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ggml_cuda_tq_mse_set_rows_i32(
+    const float * src0_d, const int32_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream);
+
+void ggml_cuda_tq_mse_set_rows_i64(
+    const float * src0_d, const int64_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream);
+
+void ggml_cuda_tq_prod_set_rows_i32(
+    const float * src0_d, const int32_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream);
+
+void ggml_cuda_tq_prod_set_rows_i64(
+    const float * src0_d, const int64_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif

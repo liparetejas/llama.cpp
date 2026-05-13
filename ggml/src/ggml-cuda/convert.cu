@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "turbo-quant.cuh"
 
 #include <cstdint>
 
@@ -760,6 +761,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TQ_MSE:
+            return ggml_cuda_tq_mse_to_f16;
+        case GGML_TYPE_TQ_PROD:
+            return ggml_cuda_tq_prod_to_f16;
         default:
             return nullptr;
     }
@@ -813,13 +818,6 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
-        case GGML_TYPE_TQ_MSE:
-            // TQ_MSE dequant requires dim context; use ggml_cuda_tq_mse_dequantize
-            // directly (dim from tensor ne[0]) instead of this generic path.
-            return nullptr;
-        case GGML_TYPE_TQ_PROD:
-            // TQ_PROD dequant requires dim context; use ggml_cuda_tq_prod_dequantize directly.
-            return nullptr;
         default:
             return nullptr;
     }

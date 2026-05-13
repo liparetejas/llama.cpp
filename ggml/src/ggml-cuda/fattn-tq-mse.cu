@@ -2,8 +2,8 @@
 #include "fattn-tq-mse.cuh"
 #include "fattn-tq-mse-vec.cuh"
 
-// Kernel selector: 0=VEC, 1=OLD 3-kernel, 2=BATCH-softmax (new)
-#define TQ_MSE_KERNEL 2
+// Kernel selector: 0=VEC, 1=OLD 3-kernel, 2=BATCH-softmax, 3=ALL-THREAD-softmax, 4=HALF-WARP
+#define TQ_MSE_KERNEL 4
 // BATCH size for kernel 2 (batched-softmax)
 #define TQ_MSE_BATCH  8
 
@@ -111,6 +111,70 @@ void ggml_cuda_flash_attn_ext_tq_mse(ggml_backend_cuda_context & ctx, ggml_tenso
         const size_t smem_batch = (NWARPS*D + 3*NWARPS + 2 + NWARPS*BATCH + NWARPS) * sizeof(float);
         const dim3 grid_partial(ne01, n_splits, ne02 * ne03);
         flash_attn_tq_mse_batch_partial_kernel<D, BATCH><<<grid_partial, block_dim, smem_batch, ctx.stream()>>>(
+            q_pi_buf.ptr, (const char*)K->data, (const char*)V->data,
+            mask ? (const char*)mask->data : nullptr,
+            dst_tmp.ptr, dst_tmp_meta.ptr,
+            max_bias, m0, m1, n_head_log2, logit_softcap,
+            ne01, ne02, ne03, ne11, ne12,
+            nb11, nb12, nb13, nb21, nb22, nb23, ne32, nb31, nb33, n_splits);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    flash_attn_tq_mse_combine<D><<<grid_combine, block_dim, smem_combine, ctx.stream()>>>(
+        dst_tmp.ptr, dst_tmp_meta.ptr, (float*)dst->data, tq_d_Pi[dim_idx], n_splits);
+    CUDA_CHECK(cudaGetLastError());
+
+#elif TQ_MSE_KERNEL == 3
+    // All-thread softmax: all 32 threads independently maintain w_kq_max/w_kq_sum.
+    // Eliminates smem aw/s_old writes+reads and __syncwarp from the hot loop.
+    // SFU cost for expf is identical to lane-0-only: hardware processes 32 threads
+    // in 4 SFU passes regardless of active count.
+    // #pragma unroll 4 hides K load latency behind shfl chain of prior token.
+    constexpr int NWARPS = D / 32;
+    ggml_cuda_pool_alloc<float> q_pi_buf(ctx.pool(), n_queries * D);
+    {
+        const dim3 grid_rot(ne01, ne02 * ne03);
+        tq_mse_rotate_q_kernel<D><<<grid_rot, block_dim, D*sizeof(float), ctx.stream()>>>(
+            (const char *)Q->data, q_pi_buf.ptr, tq_d_Pi_T[dim_idx],
+            scale, ne01, ne02, ne03, nb01, nb02, nb03);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ggml_cuda_pool_alloc<float>  dst_tmp(ctx.pool(), n_queries * n_splits * D);
+    ggml_cuda_pool_alloc<float2> dst_tmp_meta(ctx.pool(), n_queries * n_splits);
+    {
+        const size_t smem_at = (NWARPS*D + 3*NWARPS + 2) * sizeof(float);
+        const dim3 grid_partial(ne01, n_splits, ne02 * ne03);
+        flash_attn_tq_mse_allthread_kernel<D><<<grid_partial, block_dim, smem_at, ctx.stream()>>>(
+            q_pi_buf.ptr, (const char*)K->data, (const char*)V->data,
+            mask ? (const char*)mask->data : nullptr,
+            dst_tmp.ptr, dst_tmp_meta.ptr,
+            max_bias, m0, m1, n_head_log2, logit_softcap,
+            ne01, ne02, ne03, ne11, ne12,
+            nb11, nb12, nb13, nb21, nb22, nb23, ne32, nb31, nb33, n_splits);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    flash_attn_tq_mse_combine<D><<<grid_combine, block_dim, smem_combine, ctx.stream()>>>(
+        dst_tmp.ptr, dst_tmp_meta.ptr, (float*)dst->data, tq_d_Pi[dim_idx], n_splits);
+    CUDA_CHECK(cudaGetLastError());
+
+#elif TQ_MSE_KERNEL == 4
+    // Half-warp kernel: 8 half-warps of 16 threads per block.
+    // Each half-warp handles a different K token → 4-step shfl_xor (off=8,4,2,1)
+    // instead of 5-step, saving one shfl per token (~20% fewer serial shfl cycles).
+    constexpr int NHALF_WARPS = D / 16;  // 8
+    ggml_cuda_pool_alloc<float> q_pi_buf(ctx.pool(), n_queries * D);
+    {
+        const dim3 grid_rot(ne01, ne02 * ne03);
+        tq_mse_rotate_q_kernel<D><<<grid_rot, block_dim, D*sizeof(float), ctx.stream()>>>(
+            (const char *)Q->data, q_pi_buf.ptr, tq_d_Pi_T[dim_idx],
+            scale, ne01, ne02, ne03, nb01, nb02, nb03);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ggml_cuda_pool_alloc<float>  dst_tmp(ctx.pool(), n_queries * n_splits * D);
+    ggml_cuda_pool_alloc<float2> dst_tmp_meta(ctx.pool(), n_queries * n_splits);
+    {
+        const size_t smem_hw = (NHALF_WARPS*D + 3*NHALF_WARPS + 2) * sizeof(float);
+        const dim3 grid_partial(ne01, n_splits, ne02 * ne03);
+        flash_attn_tq_mse_halfwarp_kernel<D><<<grid_partial, block_dim, smem_hw, ctx.stream()>>>(
             q_pi_buf.ptr, (const char*)K->data, (const char*)V->data,
             mask ? (const char*)mask->data : nullptr,
             dst_tmp.ptr, dst_tmp_meta.ptr,
