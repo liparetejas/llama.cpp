@@ -35,8 +35,10 @@ __constant__ float tq_d_cb_1bit[TURBO_QUANT_NUM_DIMS][2];
 // Device pointer storage
 // ---------------------------------------------------------------------------
 
-float * tq_d_Pi[TURBO_QUANT_NUM_DIMS] = {nullptr, nullptr, nullptr};
-float * tq_d_S [TURBO_QUANT_NUM_DIMS] = {nullptr, nullptr, nullptr};
+float * tq_d_Pi  [TURBO_QUANT_NUM_DIMS] = {nullptr, nullptr, nullptr};
+float * tq_d_S   [TURBO_QUANT_NUM_DIMS] = {nullptr, nullptr, nullptr};
+float * tq_d_Pi_T[TURBO_QUANT_NUM_DIMS] = {nullptr, nullptr, nullptr};
+float * tq_d_S_T [TURBO_QUANT_NUM_DIMS] = {nullptr, nullptr, nullptr};
 
 // ---------------------------------------------------------------------------
 // Initialisation
@@ -63,19 +65,43 @@ static void _tq_cuda_do_init() {
         int d = tq_host_dims[di];
         size_t bytes = (size_t)d * d * sizeof(float);
 
-        // Pi
+        // Pi (row-major, Pi[i*d+j])
         CUDA_CHECK(cudaMalloc(&tq_d_Pi[di], bytes));
         CUDA_CHECK(cudaMemcpy(tq_d_Pi[di],
                               tq_get_Pi_row(d, 0),   // row-major: row 0 = start of matrix
                               bytes,
                               cudaMemcpyHostToDevice));
 
-        // S
+        // Pi_T (transposed: Pi_T[j*d+i] = Pi[i*d+j]; coalesced Phase-1 Q rotation)
+        {
+            const float * Pi_h = tq_get_Pi_row(d, 0);
+            float * Pi_T_h = (float *)malloc(bytes);
+            for (int i = 0; i < d; i++)
+                for (int j = 0; j < d; j++)
+                    Pi_T_h[j * d + i] = Pi_h[i * d + j];
+            CUDA_CHECK(cudaMalloc(&tq_d_Pi_T[di], bytes));
+            CUDA_CHECK(cudaMemcpy(tq_d_Pi_T[di], Pi_T_h, bytes, cudaMemcpyHostToDevice));
+            free(Pi_T_h);
+        }
+
+        // S (row-major, S[i*d+j])
         CUDA_CHECK(cudaMalloc(&tq_d_S[di], bytes));
         CUDA_CHECK(cudaMemcpy(tq_d_S[di],
                               tq_get_S_row(d, 0),
                               bytes,
                               cudaMemcpyHostToDevice));
+
+        // S_T (transposed: S_T[j*d+i] = S[i*d+j]; coalesced Phase-1 Q→S rotation)
+        {
+            const float * S_h = tq_get_S_row(d, 0);
+            float * S_T_h = (float *)malloc(bytes);
+            for (int i = 0; i < d; i++)
+                for (int j = 0; j < d; j++)
+                    S_T_h[j * d + i] = S_h[i * d + j];
+            CUDA_CHECK(cudaMalloc(&tq_d_S_T[di], bytes));
+            CUDA_CHECK(cudaMemcpy(tq_d_S_T[di], S_T_h, bytes, cudaMemcpyHostToDevice));
+            free(S_T_h);
+        }
     }
 }
 
@@ -548,4 +574,456 @@ extern "C" void ggml_cuda_tq_prod_dequantize(
         (const uint8_t *)x, y, dim, dim_idx, row_stride,
         tq_d_Pi[dim_idx], tq_d_S[dim_idx]);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
+// TQ_MSE → F16 conversion kernel (for flash-attention launch_fattn path)
+// Same inverse-rotation logic as tq_mse_dequantize_kernel but writes half.
+// ---------------------------------------------------------------------------
+
+__global__ void tq_mse_to_f16_kernel(
+    const uint8_t * __restrict__ x, half * __restrict__ y,
+    int dim_idx, int row_stride_bytes, const float * __restrict__ d_pi)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int dim = blockDim.x;
+
+    extern __shared__ float smem[];
+
+    const uint8_t *in_row = x + (int64_t)row * row_stride_bytes;
+
+    if (tid == 0)
+        smem[dim] = *((const float *)in_row);
+
+    uint8_t byte = in_row[4 + tid / 4];
+    int idx = (byte >> ((tid & 3) * 2)) & 3;
+    smem[tid] = tq_d_cb_2bit[dim_idx][idx];
+    __syncthreads();
+
+    float norm_val = smem[dim];
+
+    float x_hat = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_hat += d_pi[k * dim + tid] * smem[k];
+
+    y[(int64_t)row * dim + tid] = __float2half(x_hat * norm_val);
+}
+
+// ---------------------------------------------------------------------------
+// TQ_PROD → F16 conversion kernel (MSE + QJL reconstruction, output half)
+// ---------------------------------------------------------------------------
+
+__global__ void tq_prod_to_f16_kernel(
+    const uint8_t * __restrict__ x, half * __restrict__ y,
+    int dim_idx, int row_stride_bytes,
+    const float * __restrict__ d_pi, const float * __restrict__ d_s)
+{
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int dim = blockDim.x;
+
+    extern __shared__ float smem[];
+
+    const uint8_t *in_row = x + (int64_t)row * row_stride_bytes;
+    const int n_mse_bytes = (2 * dim + 7) / 8;
+
+    if (tid == 0) {
+        smem[dim]     = *((const float *)in_row);
+        smem[dim + 1] = *((const float *)(in_row + 4));
+    }
+
+    uint8_t mse_byte = in_row[8 + tid / 4];
+    int mse_idx = (mse_byte >> ((tid & 3) * 2)) & 3;
+    smem[tid] = tq_d_cb_2bit[dim_idx][mse_idx];
+    __syncthreads();
+
+    float norm_val  = smem[dim];
+    float gamma_val = smem[dim + 1];
+
+    float x_mse = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_mse += d_pi[k * dim + tid] * smem[k];
+
+    __syncthreads();
+
+    uint8_t qjl_byte = in_row[8 + n_mse_bytes + tid / 8];
+    int qjl_bit = (qjl_byte >> (tid & 7)) & 1;
+    smem[tid] = (qjl_bit == 1) ? 1.0f : -1.0f;
+    __syncthreads();
+
+    float coeff = sqrtf(3.14159265f / 2.0f) / (float)dim;
+    float x_qjl = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_qjl += d_s[k * dim + tid] * smem[k];
+    x_qjl *= coeff * gamma_val;
+
+    y[(int64_t)row * dim + tid] = __float2half((x_mse + x_qjl) * norm_val);
+}
+
+// ---------------------------------------------------------------------------
+// Host launchers for to_fp16 path (used by launch_fattn)
+// ---------------------------------------------------------------------------
+
+void ggml_cuda_tq_mse_to_f16(const void * x, half * y, int64_t k, cudaStream_t stream) {
+    tq_cuda_init();
+    const int dim     = 128;   // blck_size; only supported head_dim
+    const int dim_idx = 1;
+    const int n_rows  = (int)(k / dim);
+    const size_t shmem = (size_t)(dim + 2) * sizeof(float);
+    tq_mse_to_f16_kernel<<<n_rows, dim, shmem, stream>>>(
+        (const uint8_t *)x, y, dim_idx, (int)tq_mse_block_size(dim), tq_d_Pi[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_tq_prod_to_f16(const void * x, half * y, int64_t k, cudaStream_t stream) {
+    tq_cuda_init();
+    const int dim     = 128;
+    const int dim_idx = 1;
+    const int n_rows  = (int)(k / dim);
+    const size_t shmem = (size_t)(dim + 4) * sizeof(float);
+    tq_prod_to_f16_kernel<<<n_rows, dim, shmem, stream>>>(
+        (const uint8_t *)x, y, dim_idx, (int)tq_prod_block_size(dim),
+        tq_d_Pi[dim_idx], tq_d_S[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
+// SET_ROWS kernels for TQ_MSE and TQ_PROD
+// Each CUDA block handles one head-sized sub-vector (head_dim elements).
+// Grid: n_heads_per_row * ne01 * ne02 * ne03 blocks; blockDim.x = head_dim.
+// blockIdx.x encodes (head_in_row, i01, i02, i03) linearly:
+//   head_in_row = blockIdx.x % n_heads_per_row
+//   i01         = (blockIdx.x / n_heads_per_row) % ne01
+//   i02         = ...
+// ---------------------------------------------------------------------------
+
+template <typename idx_t>
+__global__ void tq_mse_set_rows_kernel(
+    const float  * __restrict__ src0,
+    const idx_t  * __restrict__ src1,
+    uint8_t      * __restrict__ dst,
+    int   dim, int dim_idx, int row_q_bytes, int n_heads_per_row,
+    int64_t ne01, int64_t ne02,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    const float * __restrict__ d_pi)
+{
+    const int tid = threadIdx.x;
+
+    int64_t head_in_row = blockIdx.x % n_heads_per_row;
+    int64_t row_linear  = blockIdx.x / n_heads_per_row;
+    int64_t i01         = row_linear % ne01;
+    int64_t tmp         = row_linear / ne01;
+    int64_t i02         = tmp % ne02;
+    int64_t i03         = tmp / ne02;
+
+    int64_t dst_row = (int64_t)(*(src1 + i01*s10 + i02*s11 + i03*s12));
+
+    const float * src0_head = src0 + i01*s01 + i02*s02 + i03*s03 + head_in_row * dim;
+    uint8_t     * dst_head  = dst  + dst_row*nb1 + i02*nb2 + i03*nb3 + head_in_row * row_q_bytes;
+
+    extern __shared__ float smem[];
+
+    float xi = src0_head[tid];
+    smem[tid] = xi;
+    __syncthreads();
+
+    float sq = xi * xi;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sq += __shfl_xor_sync(0xffffffffu, sq, mask);
+    if ((tid & 31) == 0)
+        smem[dim + (tid >> 5)] = sq;
+    __syncthreads();
+
+    float norm_val, inv_norm;
+    if (tid == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; w++) total += smem[dim + w];
+        norm_val = sqrtf(total);
+        smem[dim]     = norm_val;
+        smem[dim + 1] = (norm_val > 1e-20f) ? 1.0f / norm_val : 0.0f;
+    }
+    __syncthreads();
+
+    norm_val = smem[dim];
+    inv_norm = smem[dim + 1];
+    smem[tid] *= inv_norm;
+    __syncthreads();
+
+    float y_rot = 0.0f;
+    for (int k = 0; k < dim; k++)
+        y_rot += d_pi[tid * dim + k] * smem[k];
+
+    float best_dist = fabsf(y_rot - tq_d_cb_2bit[dim_idx][0]);
+    int best = 0;
+    for (int c = 1; c < 4; c++) {
+        float d = fabsf(y_rot - tq_d_cb_2bit[dim_idx][c]);
+        if (d < best_dist) { best_dist = d; best = c; }
+    }
+
+    smem[tid] = (float)best;
+    __syncthreads();
+
+    if (tid == 0)
+        *((float *)dst_head) = norm_val;
+
+    if ((tid & 3) == 0) {
+        uint8_t packed = (uint8_t)(
+            ((int)smem[tid    ]      ) |
+            ((int)smem[tid + 1] << 2) |
+            ((int)smem[tid + 2] << 4) |
+            ((int)smem[tid + 3] << 6));
+        dst_head[4 + (tid >> 2)] = packed;
+    }
+}
+
+template <typename idx_t>
+static void tq_mse_set_rows_impl(
+    const float * src0_d, const idx_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream)
+{
+    int dim_idx;
+    switch (head_dim) {
+        case  64: dim_idx = 0; break;
+        case 128: dim_idx = 1; break;
+        case 256: dim_idx = 2; break;
+        default:
+            fprintf(stderr, "tq_mse_set_rows: unsupported head_dim %d\n", head_dim);
+            return;
+    }
+    int row_q_bytes     = (int)tq_mse_block_size(head_dim);
+    int n_heads_per_row = (int)(ne00 / head_dim);
+    int64_t n_blocks    = (int64_t)n_heads_per_row * ne01 * ne02 * ne03;
+    size_t  shmem       = (size_t)(head_dim + 8) * sizeof(float);
+
+    tq_mse_set_rows_kernel<idx_t><<<(int)n_blocks, head_dim, shmem, stream>>>(
+        src0_d, src1_d, (uint8_t *)dst_d, head_dim, dim_idx, row_q_bytes, n_heads_per_row,
+        ne01, ne02, s01, s02, s03, s10, s11, s12, nb1, nb2, nb3,
+        tq_d_Pi[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+extern "C" void ggml_cuda_tq_mse_set_rows_i32(
+    const float * src0_d, const int32_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream)
+{
+    tq_cuda_init();
+    tq_mse_set_rows_impl<int32_t>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03,
+        s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+}
+
+extern "C" void ggml_cuda_tq_mse_set_rows_i64(
+    const float * src0_d, const int64_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream)
+{
+    tq_cuda_init();
+    tq_mse_set_rows_impl<int64_t>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03,
+        s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+}
+
+// ---------------------------------------------------------------------------
+// TQ_PROD SET_ROWS kernel
+// ---------------------------------------------------------------------------
+
+template <typename idx_t>
+__global__ void tq_prod_set_rows_kernel(
+    const float  * __restrict__ src0,
+    const idx_t  * __restrict__ src1,
+    uint8_t      * __restrict__ dst,
+    int   dim, int dim_idx, int row_q_bytes, int n_heads_per_row,
+    int64_t ne01, int64_t ne02,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    const float * __restrict__ d_pi,
+    const float * __restrict__ d_s)
+{
+    const int tid = threadIdx.x;
+
+    int64_t head_in_row = blockIdx.x % n_heads_per_row;
+    int64_t row_linear  = blockIdx.x / n_heads_per_row;
+    int64_t i01         = row_linear % ne01;
+    int64_t tmp         = row_linear / ne01;
+    int64_t i02         = tmp % ne02;
+    int64_t i03         = tmp / ne02;
+
+    int64_t dst_row = (int64_t)(*(src1 + i01*s10 + i02*s11 + i03*s12));
+
+    const float * src0_head = src0 + i01*s01 + i02*s02 + i03*s03 + head_in_row * dim;
+    uint8_t     * dst_head  = dst  + dst_row*nb1 + i02*nb2 + i03*nb3 + head_in_row * row_q_bytes;
+
+    extern __shared__ float smem[];
+
+    float * x_norm    = smem;
+    float * warp_buf  = smem + dim;
+    float * y_tilde   = smem + dim + 10;
+    float * gamma_buf = smem + 2*dim + 10;
+
+    float xi = src0_head[tid];
+    x_norm[tid] = xi;
+    __syncthreads();
+
+    float sq = xi * xi;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sq += __shfl_xor_sync(0xffffffffu, sq, mask);
+    if ((tid & 31) == 0)
+        warp_buf[tid >> 5] = sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; w++) total += warp_buf[w];
+        float nv = sqrtf(total);
+        smem[dim + 8] = nv;
+        smem[dim + 9] = (nv > 1e-20f) ? 1.0f / nv : 0.0f;
+    }
+    __syncthreads();
+
+    float norm_val = smem[dim + 8];
+    float inv_norm = smem[dim + 9];
+    x_norm[tid] *= inv_norm;
+    __syncthreads();
+
+    float y_rot = 0.0f;
+    for (int k = 0; k < dim; k++)
+        y_rot += d_pi[tid * dim + k] * x_norm[k];
+
+    float best_dist = fabsf(y_rot - tq_d_cb_2bit[dim_idx][0]);
+    int best = 0;
+    for (int c = 1; c < 4; c++) {
+        float d = fabsf(y_rot - tq_d_cb_2bit[dim_idx][c]);
+        if (d < best_dist) { best_dist = d; best = c; }
+    }
+
+    y_tilde[tid] = tq_d_cb_2bit[dim_idx][best];
+    __syncthreads();
+
+    float x_mse = 0.0f;
+    for (int k = 0; k < dim; k++)
+        x_mse += d_pi[k * dim + tid] * y_tilde[k];
+
+    float r_val = x_norm[tid] - x_mse;
+    x_norm[tid] = r_val;
+    __syncthreads();
+
+    float rsq = r_val * r_val;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        rsq += __shfl_xor_sync(0xffffffffu, rsq, mask);
+    if ((tid & 31) == 0)
+        gamma_buf[tid >> 5] = rsq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; w++) total += gamma_buf[w];
+        smem[2*dim + 18] = sqrtf(total);
+    }
+    __syncthreads();
+
+    float gamma_val = smem[2*dim + 18];
+
+    float sr = 0.0f;
+    for (int k = 0; k < dim; k++)
+        sr += d_s[tid * dim + k] * x_norm[k];
+
+    int qjl_bit = (sr >= 0.0f) ? 1 : 0;
+    uint32_t ballot = __ballot_sync(0xffffffffu, qjl_bit);
+
+    int n_mse_bytes = (2 * dim + 7) / 8;
+
+    if (tid == 0) {
+        *((float *)dst_head)       = norm_val;
+        *((float *)(dst_head + 4)) = gamma_val;
+    }
+
+    y_tilde[tid] = (float)best;
+    __syncthreads();
+
+    if ((tid & 3) == 0) {
+        uint8_t packed = (uint8_t)(
+            ((int)y_tilde[tid    ]      ) |
+            ((int)y_tilde[tid + 1] << 2) |
+            ((int)y_tilde[tid + 2] << 4) |
+            ((int)y_tilde[tid + 3] << 6));
+        dst_head[8 + (tid >> 2)] = packed;
+    }
+
+    if ((tid & 31) == 0) {
+        int warp_id = tid >> 5;
+        uint32_t * qjl_dst = (uint32_t *)(dst_head + 8 + n_mse_bytes + warp_id * 4);
+        *qjl_dst = ballot;
+    }
+}
+
+template <typename idx_t>
+static void tq_prod_set_rows_impl(
+    const float * src0_d, const idx_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream)
+{
+    int dim_idx;
+    switch (head_dim) {
+        case  64: dim_idx = 0; break;
+        case 128: dim_idx = 1; break;
+        case 256: dim_idx = 2; break;
+        default:
+            fprintf(stderr, "tq_prod_set_rows: unsupported head_dim %d\n", head_dim);
+            return;
+    }
+    int row_q_bytes     = (int)tq_prod_block_size(head_dim);
+    int n_heads_per_row = (int)(ne00 / head_dim);
+    int64_t n_blocks    = (int64_t)n_heads_per_row * ne01 * ne02 * ne03;
+    size_t  shmem       = (size_t)(2 * head_dim + 19) * sizeof(float);
+
+    tq_prod_set_rows_kernel<idx_t><<<(int)n_blocks, head_dim, shmem, stream>>>(
+        src0_d, src1_d, (uint8_t *)dst_d, head_dim, dim_idx, row_q_bytes, n_heads_per_row,
+        ne01, ne02, s01, s02, s03, s10, s11, s12, nb1, nb2, nb3,
+        tq_d_Pi[dim_idx], tq_d_S[dim_idx]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+extern "C" void ggml_cuda_tq_prod_set_rows_i32(
+    const float * src0_d, const int32_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream)
+{
+    tq_cuda_init();
+    tq_prod_set_rows_impl<int32_t>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03,
+        s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
+}
+
+extern "C" void ggml_cuda_tq_prod_set_rows_i64(
+    const float * src0_d, const int64_t * src1_d, void * dst_d,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t s01, int64_t s02, int64_t s03,
+    int64_t s10, int64_t s11, int64_t s12,
+    int64_t nb1, int64_t nb2, int64_t nb3,
+    int head_dim, cudaStream_t stream)
+{
+    tq_cuda_init();
+    tq_prod_set_rows_impl<int64_t>(src0_d, src1_d, dst_d, ne00, ne01, ne02, ne03,
+        s01, s02, s03, s10, s11, s12, nb1, nb2, nb3, head_dim, stream);
 }

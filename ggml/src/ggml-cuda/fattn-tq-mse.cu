@@ -47,7 +47,7 @@ void ggml_cuda_flash_attn_ext_tq_mse(ggml_backend_cuda_context & ctx, ggml_tenso
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int base_blocks    = ne01 * ne02 * ne03;
     const int min_splits     = (4 * nsm + base_blocks - 1) / base_blocks;
-    const int tks = (ne11 > 16384) ? 1024 : 256;
+    const int tks = (ne11 > 16384) ? 1024 : (ne11 > 8192) ? 128 : 256;
     const int splits_by_size = (ne11 + tks - 1) / tks;
     int n_splits = min(ne11, max(min_splits, splits_by_size));
     if (n_splits < 1) n_splits = 1;

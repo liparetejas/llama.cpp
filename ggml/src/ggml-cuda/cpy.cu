@@ -549,28 +549,28 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TQ_MSE) {
         GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
-        const int dim    = (int)src0->ne[0];
+        const int dim    = (int)ggml_blck_size(src1->type);
         const int n_rows = (int)(ne / dim);
         ggml_cuda_tq_mse_quantize(
             (const float *)src0_ddc, (void *)src1_ddc,
             dim, n_rows, main_stream);
     } else if (src0->type == GGML_TYPE_TQ_MSE && src1->type == GGML_TYPE_F32) {
         GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
-        const int dim    = (int)src0->ne[0];
+        const int dim    = (int)ggml_blck_size(src0->type);
         const int n_rows = (int)(ne / dim);
         ggml_cuda_tq_mse_dequantize(
             (const void *)src0_ddc, (float *)src1_ddc,
             dim, n_rows, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TQ_PROD) {
         GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
-        const int dim    = (int)src0->ne[0];
+        const int dim    = (int)ggml_blck_size(src1->type);
         const int n_rows = (int)(ne / dim);
         ggml_cuda_tq_prod_quantize(
             (const float *)src0_ddc, (void *)src1_ddc,
             dim, n_rows, main_stream);
     } else if (src0->type == GGML_TYPE_TQ_PROD && src1->type == GGML_TYPE_F32) {
         GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
-        const int dim    = (int)src0->ne[0];
+        const int dim    = (int)ggml_blck_size(src0->type);
         const int n_rows = (int)(ne / dim);
         ggml_cuda_tq_prod_dequantize(
             (const void *)src0_ddc, (float *)src1_ddc,
