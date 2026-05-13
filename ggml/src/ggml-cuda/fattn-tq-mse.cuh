@@ -134,6 +134,13 @@ __global__ void flash_attn_tq_mse_partial_kernel(
     float * const global_slot   = scale_arr + NWARPS;        // 1 float
     float * const finsum_slot   = global_slot + 1;           // 1 float
 
+    // Codebook into scalar registers — 2 SEL instructions per lookup, no memory in hot loop
+    const float cb_r0 = tq_d_cb_2bit[dim_idx][0];
+    const float cb_r1 = tq_d_cb_2bit[dim_idx][1];
+    const float cb_r2 = tq_d_cb_2bit[dim_idx][2];
+    const float cb_r3 = tq_d_cb_2bit[dim_idx][3];
+    #define CB_SEL_P(idx) (((idx) & 2) ? (((idx) & 1) ? cb_r3 : cb_r2) : (((idx) & 1) ? cb_r1 : cb_r0))
+
     // Per-warp registers: running softmax state + 4-element accumulator
     float w_kq_max = -FLT_MAX / 2.0f;
     float w_kq_sum = 0.0f;
@@ -144,14 +151,15 @@ __global__ void flash_attn_tq_mse_partial_kernel(
         const uint8_t * K_blk = (const uint8_t *)(K_head + (int64_t)k * nb11);
         const uint8_t * V_blk = (const uint8_t *)(V_head + (int64_t)k * nb21);
 
-        // Decode 2-bit indices for 4 elements per thread
-        const float cb_k0 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi0] >> bs0) & 3];
-        const float cb_k1 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi1] >> bs0) & 3];
-        const float cb_k2 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi2] >> bs0) & 3];
-        const float cb_k3 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi3] >> bs0) & 3];
+        // Decode 2-bit indices for 4 elements per thread using register select
+        const float cb_k0 = CB_SEL_P((K_blk[4 + bi0] >> bs0) & 3);
+        const float cb_k1 = CB_SEL_P((K_blk[4 + bi1] >> bs0) & 3);
+        const float cb_k2 = CB_SEL_P((K_blk[4 + bi2] >> bs0) & 3);
+        const float cb_k3 = CB_SEL_P((K_blk[4 + bi3] >> bs0) & 3);
 
         // Dot product: 4 partial contributions, then warp reduce
         float partial = qp0*cb_k0 + qp1*cb_k1 + qp2*cb_k2 + qp3*cb_k3;
+        #pragma unroll
         for (int off = 16; off >= 1; off >>= 1) {
             partial += __shfl_xor_sync(0xFFFFFFFF, partial, off);
         }
@@ -173,18 +181,19 @@ __global__ void flash_attn_tq_mse_partial_kernel(
         a_w   = __shfl_sync(0xFFFFFFFF, a_w,   0);
         s_old = __shfl_sync(0xFFFFFFFF, s_old, 0);
 
-        // V accumulation for 4 elements
+        // V accumulation for 4 elements using register select
         const float norm_v = *((const float *) V_blk);
         const float aw_nv  = a_w * norm_v;
-        const float cb_v0 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi0] >> bs0) & 3];
-        const float cb_v1 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi1] >> bs0) & 3];
-        const float cb_v2 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi2] >> bs0) & 3];
-        const float cb_v3 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi3] >> bs0) & 3];
+        const float cb_v0 = CB_SEL_P((V_blk[4 + bi0] >> bs0) & 3);
+        const float cb_v1 = CB_SEL_P((V_blk[4 + bi1] >> bs0) & 3);
+        const float cb_v2 = CB_SEL_P((V_blk[4 + bi2] >> bs0) & 3);
+        const float cb_v3 = CB_SEL_P((V_blk[4 + bi3] >> bs0) & 3);
         w_acc0 = fmaf(aw_nv, cb_v0, w_acc0 * s_old);
         w_acc1 = fmaf(aw_nv, cb_v1, w_acc1 * s_old);
         w_acc2 = fmaf(aw_nv, cb_v2, w_acc2 * s_old);
         w_acc3 = fmaf(aw_nv, cb_v3, w_acc3 * s_old);
     }
+    #undef CB_SEL_P
 
     // Store each warp's acc_rot to smem — stride-32 layout for the merge step
     warp_acc_smem[warp_id * D + lane_id]      = w_acc0;
@@ -227,6 +236,241 @@ __global__ void flash_attn_tq_mse_partial_kernel(
 
     // Store raw acc_rot (Pi-rotated domain); unrotation deferred to combine kernel.
     const int j_dst = ((sequence * ne01 + ic0) * ne02 + head);
+    const int64_t base = ((int64_t)j_dst * n_splits + split) * D;
+    if (warp_id == 0) {
+        dst_parts[base + lane_id]      = out0;
+        dst_parts[base + lane_id + 32] = out1;
+        dst_parts[base + lane_id + 64] = out2;
+        dst_parts[base + lane_id + 96] = out3;
+    }
+    if (tid == 0) {
+        dst_meta[(int64_t)j_dst * n_splits + split] = make_float2(*global_slot, final_sum);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 2b: Batched-softmax split-K partial attention.
+//
+// Same Q/K/V layout as flash_attn_tq_mse_partial_kernel. Key difference:
+//   OLD: per K token → 2 expf at lane 0 + 2 shfl_sync broadcasts = 64 expf/32 tokens
+//   NEW: per BATCH K tokens → 1 s_old + BATCH a_w at lane 0 = 33 expf/32 tokens (1.94×)
+//        a_w values written to smem, __syncwarp(), all threads read for V accumulation.
+//        Eliminates the 2 shfl_sync broadcasts per token entirely.
+//
+// Extra smem over partial_kernel: NWARPS*(BATCH+1) floats = 132 floats = 528 bytes.
+// Total smem: (NWARPS*D + 3*NWARPS + 2 + NWARPS*(BATCH+1)) * sizeof(float) = 2616 bytes.
+// ---------------------------------------------------------------------------
+template<int D, int BATCH>
+__launch_bounds__(D, 4)
+__global__ void flash_attn_tq_mse_batch_partial_kernel(
+        const float  * __restrict__ q_pi_buf,
+        const char   * __restrict__ K_data,
+        const char   * __restrict__ V_data,
+        const char   * __restrict__ mask,
+        float        * __restrict__ dst_parts,
+        float2       * __restrict__ dst_meta,
+        const float  max_bias,
+        const float  m0,
+        const float  m1,
+        const uint32_t n_head_log2,
+        const float  logit_softcap,
+        const int32_t ne01,
+        const int32_t ne02,
+        const int32_t ne03,
+        const int32_t ne11,
+        const int32_t ne12,
+        const int32_t nb11,
+        const int32_t nb12,
+        const int64_t nb13,
+        const int32_t nb21,
+        const int32_t nb22,
+        const int64_t nb23,
+        const int32_t ne32,
+        const int32_t nb31,
+        const int64_t nb33,
+        const int32_t n_splits
+) {
+    static_assert(D == 128,      "flash_attn_tq_mse_batch: only D=128 supported");
+    static_assert(BATCH >= 1,    "BATCH must be >= 1");
+    constexpr int NWARPS = D / WARP_SIZE;  // 4
+    constexpr int dim_idx = 1;
+
+    const int tid      = threadIdx.x;
+    const int warp_id  = tid / WARP_SIZE;
+    const int lane_id  = tid % WARP_SIZE;
+    const int ic0      = blockIdx.x;
+    const int split    = blockIdx.y;
+    const int head     = blockIdx.z % ne02;
+    const int sequence = blockIdx.z / ne02;
+    const int gqa_ratio = ne02 / ne12;
+
+    const int tokens_per_split = (ne11 + n_splits - 1) / n_splits;
+    const int k_start = split * tokens_per_split;
+    const int k_end   = min(k_start + tokens_per_split, ne11);
+
+    const int64_t q_idx = ((int64_t)(sequence * ne01 + ic0) * ne02 + head) * D;
+    const float qp0 = q_pi_buf[q_idx + lane_id];
+    const float qp1 = q_pi_buf[q_idx + lane_id + 32];
+    const float qp2 = q_pi_buf[q_idx + lane_id + 64];
+    const float qp3 = q_pi_buf[q_idx + lane_id + 96];
+
+    const char * K_head = K_data + (int64_t)nb13*sequence + (int64_t)nb12*(head/gqa_ratio);
+    const char * V_head = V_data + (int64_t)nb23*sequence + (int64_t)nb22*(head/gqa_ratio);
+    const half * maskh  = mask ? (const half *)(mask + (int64_t)nb33*(sequence%ne32)
+                                                      + (int64_t)nb31*ic0) : nullptr;
+    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+
+    const int bs0 = (lane_id & 3) << 1;
+    const int bi0 = lane_id >> 2;
+    const int bi1 = bi0 + (D/4/4);
+    const int bi2 = bi0 + (2*D/4/4);
+    const int bi3 = bi0 + (3*D/4/4);
+
+    // Smem layout:
+    // [warp_acc_rot: NWARPS*D | kq_max_arr: NWARPS | kq_sum_arr: NWARPS |
+    //  scale_arr: NWARPS | global_slot: 1 | finsum_slot: 1 |
+    //  aw_smem: NWARPS*BATCH | sold_smem: NWARPS]
+    extern __shared__ float smem[];
+    float * const warp_acc_smem = smem;
+    float * const kq_max_arr    = smem + NWARPS * D;
+    float * const kq_sum_arr    = kq_max_arr + NWARPS;
+    float * const scale_arr     = kq_sum_arr + NWARPS;
+    float * const global_slot   = scale_arr  + NWARPS;
+    float * const finsum_slot   = global_slot + 1;
+    float * const aw_smem       = finsum_slot + 1;           // NWARPS*BATCH floats
+    float * const sold_smem     = aw_smem + NWARPS * BATCH;  // NWARPS floats
+
+    // Load 4-entry codebook into scalar registers — eliminates global/L1 lookup in hot loop.
+    // Uses 2 SEL (predicated register select) instructions per lookup instead of a load.
+    const float cb_r0 = tq_d_cb_2bit[dim_idx][0];
+    const float cb_r1 = tq_d_cb_2bit[dim_idx][1];
+    const float cb_r2 = tq_d_cb_2bit[dim_idx][2];
+    const float cb_r3 = tq_d_cb_2bit[dim_idx][3];
+
+    // 2-way predicated select (2 cycles, no memory): compiles to 2 FSEL instructions.
+    #define CB_SEL(idx) (((idx) & 2) ? (((idx) & 1) ? cb_r3 : cb_r2) : (((idx) & 1) ? cb_r1 : cb_r0))
+
+    float w_kq_max = -FLT_MAX / 2.0f;
+    float w_kq_sum = 0.0f;
+    float w_acc0 = 0.0f, w_acc1 = 0.0f, w_acc2 = 0.0f, w_acc3 = 0.0f;
+
+    // Outer loop: each warp starts at k_start + warp_id*BATCH, strides by NWARPS*BATCH.
+    // Inner loops use BATCH as compile-time bound (enables #pragma unroll).
+    // Edge case (last batch with fewer than BATCH tokens) uses predication via early break.
+    for (int k_batch = k_start + warp_id * BATCH; k_batch < k_end; k_batch += NWARPS * BATCH) {
+        // -- Phase A: compute BATCH dot products (all 32 threads participate) ---------
+        // KQ_buf written only by lane 0; predicated dead at other lanes by compiler.
+        float KQ_buf[BATCH];
+        #pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const int k = k_batch + b;
+            if (k >= k_end) break;
+            const uint8_t * K_blk = (const uint8_t *)(K_head + (int64_t)k * nb11);
+            const float cb_k0 = CB_SEL((K_blk[4 + bi0] >> bs0) & 3);
+            const float cb_k1 = CB_SEL((K_blk[4 + bi1] >> bs0) & 3);
+            const float cb_k2 = CB_SEL((K_blk[4 + bi2] >> bs0) & 3);
+            const float cb_k3 = CB_SEL((K_blk[4 + bi3] >> bs0) & 3);
+            float partial = qp0*cb_k0 + qp1*cb_k1 + qp2*cb_k2 + qp3*cb_k3;
+            #pragma unroll
+            for (int off = 16; off >= 1; off >>= 1)
+                partial += __shfl_xor_sync(0xFFFFFFFF, partial, off);
+            if (lane_id == 0) {
+                const float norm_k = *((const float *) K_blk);
+                float kq = partial * norm_k;
+                if (logit_softcap != 0.0f) kq = logit_softcap * tanhf(kq);
+                if (maskh) kq += slope * __half2float(maskh[k]);
+                KQ_buf[b] = kq;
+            }
+        }
+
+        // -- Phase B: lane 0 only — batch softmax, write a_w & s_old to smem ----------
+        if (lane_id == 0) {
+            const int batch_size = min(BATCH, k_end - k_batch);
+            float batch_max = KQ_buf[0];
+            #pragma unroll
+            for (int b = 1; b < BATCH; b++) {
+                if (b < batch_size) batch_max = fmaxf(batch_max, KQ_buf[b]);
+            }
+            const float kq_max_new = fmaxf(w_kq_max, batch_max + FATTN_KQ_MAX_OFFSET);
+            const float s_old = expf(w_kq_max - kq_max_new);
+            w_kq_max = kq_max_new;
+            sold_smem[warp_id] = s_old;
+            float batch_sum = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < BATCH; b++) {
+                if (b < batch_size) {
+                    const float a_w = expf(KQ_buf[b] - kq_max_new);
+                    aw_smem[warp_id * BATCH + b] = a_w;
+                    batch_sum += a_w;
+                }
+            }
+            w_kq_sum = w_kq_sum * s_old + batch_sum;
+        }
+        __syncwarp();
+
+        // -- Phase C: all threads read s_old & a_w, accumulate V ---------------------
+        const float s_old_val = sold_smem[warp_id];
+        w_acc0 *= s_old_val;
+        w_acc1 *= s_old_val;
+        w_acc2 *= s_old_val;
+        w_acc3 *= s_old_val;
+        #pragma unroll
+        for (int b = 0; b < BATCH; b++) {
+            const int k = k_batch + b;
+            if (k >= k_end) break;
+            const uint8_t * V_blk = (const uint8_t *)(V_head + (int64_t)k * nb21);
+            const float a_w   = aw_smem[warp_id * BATCH + b];
+            const float norm_v = *((const float *) V_blk);
+            const float aw_nv  = a_w * norm_v;
+            const float cb_v0 = CB_SEL((V_blk[4 + bi0] >> bs0) & 3);
+            const float cb_v1 = CB_SEL((V_blk[4 + bi1] >> bs0) & 3);
+            const float cb_v2 = CB_SEL((V_blk[4 + bi2] >> bs0) & 3);
+            const float cb_v3 = CB_SEL((V_blk[4 + bi3] >> bs0) & 3);
+            w_acc0 += aw_nv * cb_v0;
+            w_acc1 += aw_nv * cb_v1;
+            w_acc2 += aw_nv * cb_v2;
+            w_acc3 += aw_nv * cb_v3;
+        }
+    }
+
+    #undef CB_SEL
+
+    // -- Merge phase (identical to flash_attn_tq_mse_partial_kernel) -----------------
+    warp_acc_smem[warp_id * D + lane_id]      = w_acc0;
+    warp_acc_smem[warp_id * D + lane_id + 32] = w_acc1;
+    warp_acc_smem[warp_id * D + lane_id + 64] = w_acc2;
+    warp_acc_smem[warp_id * D + lane_id + 96] = w_acc3;
+    if (lane_id == 0) {
+        kq_max_arr[warp_id] = w_kq_max;
+        kq_sum_arr[warp_id] = w_kq_sum;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float gmax = kq_max_arr[0];
+        for (int w = 1; w < NWARPS; w++) gmax = fmaxf(gmax, kq_max_arr[w]);
+        float fsum = 0.0f;
+        for (int w = 0; w < NWARPS; w++) {
+            const float sc = expf(kq_max_arr[w] - gmax);
+            scale_arr[w] = sc;
+            fsum += sc * kq_sum_arr[w];
+        }
+        *global_slot = gmax;
+        *finsum_slot = fsum;
+    }
+    __syncthreads();
+
+    const float final_sum = *finsum_slot;
+    float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+    for (int w = 0; w < NWARPS; w++) {
+        const float sc = scale_arr[w];
+        out0 = fmaf(sc, warp_acc_smem[w * D + lane_id],      out0);
+        out1 = fmaf(sc, warp_acc_smem[w * D + lane_id + 32], out1);
+        out2 = fmaf(sc, warp_acc_smem[w * D + lane_id + 64], out2);
+        out3 = fmaf(sc, warp_acc_smem[w * D + lane_id + 96], out3);
+    }
+
+    const int j_dst = (sequence * ne01 + ic0) * ne02 + head;
     const int64_t base = ((int64_t)j_dst * n_splits + split) * D;
     if (warp_id == 0) {
         dst_parts[base + lane_id]      = out0;
