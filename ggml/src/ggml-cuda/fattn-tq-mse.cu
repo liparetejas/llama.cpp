@@ -3,7 +3,7 @@
 #include "fattn-tq-mse-vec.cuh"
 
 // Kernel selector: 0=VEC, 1=OLD 3-kernel, 2=BATCH-softmax, 3=ALL-THREAD-softmax, 4=HALF-WARP
-#define TQ_MSE_KERNEL 4
+#define TQ_MSE_KERNEL 0
 // BATCH size for kernel 2 (batched-softmax)
 #define TQ_MSE_BATCH  8
 

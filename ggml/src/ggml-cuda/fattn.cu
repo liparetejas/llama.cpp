@@ -332,12 +332,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const int cc = ggml_cuda_info().devices[device].cc;
 
     // Fused TQ_MSE kernel: both K and V are TQ_MSE, D=128, any sm_75+
-    if (K->type == GGML_TYPE_TQ_MSE && V->type == GGML_TYPE_TQ_MSE && K->ne[0] == 128) {
+    // Only use for decode phase (ne01 <= 8). For prompt phase, falling through converts to F16.
+    if (K->type == GGML_TYPE_TQ_MSE && V->type == GGML_TYPE_TQ_MSE && K->ne[0] == 128 && Q->ne[1] <= 8) {
         return BEST_FATTN_KERNEL_TQ_MSE;
     }
 
     // Fused TQ_PROD kernel: both K and V are TQ_PROD, D=128, any sm_75+
-    if (K->type == GGML_TYPE_TQ_PROD && V->type == GGML_TYPE_TQ_PROD && K->ne[0] == 128) {
+    if (K->type == GGML_TYPE_TQ_PROD && V->type == GGML_TYPE_TQ_PROD && K->ne[0] == 128 && Q->ne[1] <= 8) {
         return BEST_FATTN_KERNEL_TQ_PROD;
     }
 

@@ -100,6 +100,7 @@ __global__ void flash_attn_tq_mse_vec_kernel(
     float * const scale_arr    = kq_sum_arr + NWARPS;
     float * const global_slot  = scale_arr  + NWARPS;
     float * const finsum_slot  = global_slot + 1;
+    float * const smem_table   = finsum_slot + 1; // 1024 floats
 
     // ------------------------------------------------------------------
     // Phase 0: Q rotation fused inline — all D threads cooperate once.
@@ -123,11 +124,22 @@ __global__ void flash_attn_tq_mse_vec_kernel(
     q_rot_smem[tid] = (qr0 + qr1 + qr2 + qr3) * scale;
     __syncthreads();
 
-    // Load rotated Q into per-thread registers (stride-32 layout)
-    const float qp0 = q_rot_smem[lane_id];
-    const float qp1 = q_rot_smem[lane_id + 32];
-    const float qp2 = q_rot_smem[lane_id + 64];
-    const float qp3 = q_rot_smem[lane_id + 96];
+    // --- Precompute 4KB SRAM lookup table (2-element chunks = 64 pairs) ---
+    // Thread i computes 8 values. pair_idx = tid % 64, base_nib = (tid / 64) * 8
+    {
+        const int pair_idx = tid % 64;
+        const int base_nib = (tid / 64) * 8;
+        const float cb_q0 = q_rot_smem[pair_idx * 2 + 0];
+        const float cb_q1 = q_rot_smem[pair_idx * 2 + 1];
+
+        for (int i = 0; i < 8; i++) {
+            const int nibble = base_nib + i;
+            float val = cb_q0 * tq_d_cb_2bit[dim_idx][nibble & 3]
+                      + cb_q1 * tq_d_cb_2bit[dim_idx][(nibble >> 2) & 3];
+            smem_table[nibble * 64 + pair_idx] = val;
+        }
+        __syncthreads();
+    }
     // q_rot_smem is now free; we'll reuse it as a_w scratch below
 
     // Per-thread bit-extraction offsets (same layout as old partial kernel)
@@ -146,6 +158,13 @@ __global__ void flash_attn_tq_mse_vec_kernel(
     float w_kq_max = -FLT_MAX / 2.0f;
     float w_kq_sum = 0.0f;
     float w_acc0=0.0f, w_acc1=0.0f, w_acc2=0.0f, w_acc3=0.0f;
+
+    // Preload V codebook centroids into shared memory
+    float * const v_cb_smem = smem_table + 1024;
+    if (tid < 4) {
+        v_cb_smem[tid] = tq_d_cb_2bit[dim_idx][tid];
+    }
+    __syncthreads();
 
     // Warp-private a_w buffer: use [warp_id*WARP_SIZE .. (warp_id+1)*WARP_SIZE)
     // of q_rot_smem. Each warp writes its own region; no cross-warp conflict.
@@ -181,12 +200,12 @@ __global__ void flash_attn_tq_mse_vec_kernel(
             const int k = k_outer + i_kq;
             const uint8_t * K_blk = (const uint8_t *)(K_head + (int64_t)k * nb11);
 
-            const float cb_k0 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi0] >> bs0) & 3];
-            const float cb_k1 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi1] >> bs0) & 3];
-            const float cb_k2 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi2] >> bs0) & 3];
-            const float cb_k3 = tq_d_cb_2bit[dim_idx][(K_blk[4 + bi3] >> bs0) & 3];
+            const uint8_t byte_val = K_blk[4 + lane_id];
+            const int nib0 = byte_val & 0x0F;
+            const int nib1 = byte_val >> 4;
+            float partial = smem_table[nib0 * 64 + lane_id * 2 + 0] +
+                            smem_table[nib1 * 64 + lane_id * 2 + 1];
 
-            float partial = qp0*cb_k0 + qp1*cb_k1 + qp2*cb_k2 + qp3*cb_k3;
             #pragma unroll
             for (int off = 16; off >= 1; off >>= 1)
                 partial += __shfl_xor_sync(0xFFFFFFFF, partial, off);
@@ -243,10 +262,10 @@ __global__ void flash_attn_tq_mse_vec_kernel(
             const uint8_t * V_blk = (const uint8_t *)(V_head + (int64_t)k * nb21);
             const float norm_v = *((const float *)V_blk);
             const float aw_nv  = a_w_k * norm_v;
-            const float cb_v0 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi0] >> bs0) & 3];
-            const float cb_v1 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi1] >> bs0) & 3];
-            const float cb_v2 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi2] >> bs0) & 3];
-            const float cb_v3 = tq_d_cb_2bit[dim_idx][(V_blk[4 + bi3] >> bs0) & 3];
+            const float cb_v0 = v_cb_smem[(V_blk[4 + bi0] >> bs0) & 3];
+            const float cb_v1 = v_cb_smem[(V_blk[4 + bi1] >> bs0) & 3];
+            const float cb_v2 = v_cb_smem[(V_blk[4 + bi2] >> bs0) & 3];
+            const float cb_v3 = v_cb_smem[(V_blk[4 + bi3] >> bs0) & 3];
             w_acc0 += aw_nv * cb_v0;
             w_acc1 += aw_nv * cb_v1;
             w_acc2 += aw_nv * cb_v2;

@@ -55,7 +55,7 @@ void ggml_cuda_flash_attn_ext_tq_mse_vec(ggml_backend_cuda_context & ctx, ggml_t
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int base_blocks    = ne01 * ne02 * ne03;
     const int min_splits     = (4 * nsm + base_blocks - 1) / base_blocks;
-    const int tks = (ne11 > 16384) ? 1024 : 256;
+    const int tks = 8192;
     const int splits_by_size = (ne11 + tks - 1) / tks;
     int n_splits = min(ne11, max(min_splits, splits_by_size));
     if (n_splits < 1) n_splits = 1;
@@ -67,7 +67,7 @@ void ggml_cuda_flash_attn_ext_tq_mse_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(ctx.pool(), n_queries * n_splits);
 
     constexpr int NWARPS = D / 32;
-    const size_t smem_vec = (D + NWARPS*D + 3*NWARPS + 2) * sizeof(float);  // 2616 bytes
+    const size_t smem_vec = (D + NWARPS*D + 3*NWARPS + 2 + 1028) * sizeof(float);  // ~6.7KB
     const dim3 grid_vec(ne01, n_splits, ne02 * ne03);
     const dim3 block_dim(D);
 
